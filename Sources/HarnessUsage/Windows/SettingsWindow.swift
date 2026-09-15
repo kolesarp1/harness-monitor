@@ -9,12 +9,13 @@ import SwiftUI
     let settings: SettingsStore
     var integrations: IntegrationStore?
     var usage: UsageStore?
-    var login: AccountLoginController?
-    var onRenameAccount: (UsageSnapshot, Integration) -> Void = { _, _ in }
+    /// The tracked accounts, in `accounts.json` order — one pane each, after General. Passed in
+    /// rather than read from `Accounts`, so `--mock` shows the mock accounts.
+    let accounts: [AccountConfig]
+    var onAccountSourceChanged: @MainActor (Integration) async -> Void = { _ in }
+    var onAddSubscription: @MainActor (Harness) -> Void = { _ in }
+    var onDeleteSubscription: @MainActor (Integration) -> Void = { _ in }
     var onClose: () -> Void = {}
-    /// Deep-link a pane for previews and tests ("general" or an integration raw value). Nil keeps
-    /// the last-selected default.
-    var initialPane: String? = nil
 
     @State private var pane: Pane = .general
 
@@ -37,18 +38,23 @@ import SwiftUI
         }
         .frame(width: Self.contentSize.width, height: Self.contentSize.height)
         .glassChrome()
-        .onAppear {
-            if let initialPane { pane = Pane(id: initialPane) ?? .general }
-        }
     }
 
     // MARK: sidebar
 
     private var sidebar: some View {
         VStack(spacing: 2) {
-            ForEach(Self.panes) { sidebarRow($0) }
+            ForEach(panes) { sidebarRow($0) }
+            HStack(spacing: 5) {
+                Button("+ Claude") { onAddSubscription(.claude) }
+                Button("+ Codex") { onAddSubscription(.codex) }
+            }
+            .font(.system(size: 10, weight: .medium))
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.csAccent)
+            .padding(.top, 5)
             Spacer(minLength: 8)
-            Text("Harness Monitor · \(Self.version)")
+            Text("Harness Usage · \(Self.version)")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.csFaint)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -98,12 +104,12 @@ import SwiftUI
                     Image(systemName: "house.fill")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(selected ? Color.csOnAccent : Color.csLabel)
-                case .provider(let integration):
+                case .provider(let account):
                     // The provider's own mark in its own colors, selected or not — the accent tile is
                     // the selection signal; repainting the mark would only blur it. A selected tile is
                     // a light surface, so an adaptive mark inverts against the TILE, not the window.
                     BrandMark(
-                        integration: integration, size: 20, tint: integration.descriptor.brandColor,
+                        integration: account.integration, size: 20, tint: account.integration.descriptor.brandColor,
                         colorSchemeOverride: selected ? .light : nil)
                 }
             }
@@ -123,10 +129,12 @@ import SwiftUI
                 switch pane {
                 case .general:
                     GeneralPane(settings: settings)
-                case .provider(let integration):
+                case .provider(let account):
                     ProviderPane(
-                        settings: settings, integration: integration, integrations: integrations, usage: usage,
-                        login: login, onRenameAccount: onRenameAccount)
+                        settings: settings, account: account, integrations: integrations, usage: usage,
+                        onAccountSourceChanged: onAccountSourceChanged,
+                        canDelete: accounts.filter { $0.harness == account.harness }.count > 1,
+                        onDeleteSubscription: onDeleteSubscription)
                 }
             }
             .id(pane.id)
@@ -142,37 +150,27 @@ import SwiftUI
 
     private enum Pane: Equatable, Identifiable {
         case general
-        case provider(Integration)
-
-        init?(id: String) {
-            if id == "general" {
-                self = .general
-            } else if let integration = Integration(rawValue: id) {
-                self = .provider(integration)
-            } else {
-                return nil
-            }
-        }
+        case provider(AccountConfig)
 
         var id: String {
             switch self {
             case .general: "general"
-            case .provider(let integration): "provider-\(integration.rawValue)"
+            case .provider(let account): "provider-\(account.integration.rawValue)"
             }
         }
 
         var title: String {
             switch self {
             case .general: "General"
-            case .provider(let integration): integration.displayName
+            // `displayName` carries the account label once a harness has more than one, so two
+            // Claude panes read "Claude · Personal" and "Claude · Work" rather than twice the same.
+            case .provider(let account): account.integration.displayName
             }
         }
     }
 
-    // Only supported integrations get a sidebar pane. Suspended cases keep their stored settings
-    // but are never shown or initialized.
-    private static var panes: [Pane] {
-        [.general] + Integration.supportedCases.map(Pane.provider)
+    private var panes: [Pane] {
+        [.general] + accounts.map(Pane.provider)
     }
 }
 
@@ -192,17 +190,6 @@ private struct GeneralPane: View {
                     SettingsToggle(isOn: Binding(get: { launchAtLogin }, set: { setLaunchAtLogin($0) }))
                         .disabled(LoginItem.unavailableReason != nil)
                         .opacity(LoginItem.unavailableReason == nil ? 1 : 0.5)
-                }
-            }
-            SettingsGroup("Usage") {
-                SettingsRow("Update every") {
-                    PopupControl(
-                        options: [
-                            ("1 minute", UsageUpdateInterval.oneMinute),
-                            ("5 minutes", .fiveMinutes),
-                            ("15 minutes", .fifteenMinutes),
-                        ],
-                        selection: settings.bind(\.updateInterval), accessibilityLabel: "Update every")
                 }
             }
             SettingsGroup("Notch") {
@@ -264,7 +251,7 @@ private struct GeneralPane: View {
 
     // Reflects what was asked for, not a fresh `status` read: SMAppService settles its status
     // asynchronously, so re-reading here snaps the switch back — and because that write re-enters this
-    // setter, it then unregisters the item it has just registered.
+    // setter, it then unregisters the item it has just registered (mac-utils hit exactly this).
     private func setLaunchAtLogin(_ on: Bool) {
         guard LoginItem.setEnabled(on) else {
             loginRefused = true
@@ -278,72 +265,56 @@ private struct GeneralPane: View {
 
 private struct ProviderPane: View {
     let settings: SettingsStore
-    let integration: Integration
+    let account: AccountConfig
     var integrations: IntegrationStore?
     var usage: UsageStore?
-    var login: AccountLoginController?
-    var onRenameAccount: (UsageSnapshot, Integration) -> Void = { _, _ in }
+    var onAccountSourceChanged: @MainActor (Integration) async -> Void
+    let canDelete: Bool
+    var onDeleteSubscription: @MainActor (Integration) -> Void
+    @State private var remote = false
+    @State private var remoteServer = ""
+    @State private var tokenLocation = ""
+    @State private var remoteLogin = RemoteLogin()
+    @State private var remoteLoginResponse = ""
+    @State private var sourceSaved = false
+
+    private var integration: Integration { account.integration }
+
+    init(
+        settings: SettingsStore, account: AccountConfig, integrations: IntegrationStore?, usage: UsageStore?,
+        onAccountSourceChanged: @escaping @MainActor (Integration) async -> Void,
+        canDelete: Bool, onDeleteSubscription: @escaping @MainActor (Integration) -> Void
+    ) {
+        self.settings = settings
+        self.account = account
+        self.integrations = integrations
+        self.usage = usage
+        self.onAccountSourceChanged = onAccountSourceChanged
+        self.canDelete = canDelete
+        self.onDeleteSubscription = onDeleteSubscription
+        _remote = State(initialValue: account.host.isRemote)
+        _remoteServer = State(initialValue: account.host.sshAlias ?? "")
+        _tokenLocation = State(initialValue: account.configDir ?? "~/\(account.harness.descriptor.homeRelativePath)")
+    }
 
     private func detected(_ i: Integration) -> Bool { integrations?.detected.contains(i) ?? true }
 
-    private var providerSnapshots: [UsageSnapshot] {
-        (usage?.keys(for: integration) ?? []).compactMap { usage?[$0] }
-    }
-
-    private var providerAvailable: Bool {
-        ProviderPaneLogic.isAvailable(
-            detected: detected(integration), snapshots: providerSnapshots,
-            accountRemembered: login?.accountIntegrations.contains(integration) == true)
-    }
-
-    private func hint(_: Integration) -> String? {
-        ProviderPaneLogic.hint(available: providerAvailable, snapshots: providerSnapshots)
-    }
-
-    private var accountsFooter: String {
-        let folder = "~/\(integration.descriptor.homeRelativePath)"
-        return "Detected from \(folder) and \(folder)-* folders, or add an account by signing in."
+    // The row's second line, or nil for the ordinary case. An undetected harness says so; a detected
+    // one speaks only when its last read failed (expired login, unreachable endpoint), which is how a
+    // tier that silently never fires names itself.
+    private func hint(_ i: Integration) -> String? {
+        detected(i) ? usage?[i]?.note : "Not detected on this Mac"
     }
 
     private var supportsTokens: Bool { integration.descriptor.reportsTokens }
 
     private var tokenSubtitle: String {
-        supportsTokens
-            ? "Today's tokens in, out, and total, counted from local sessions on this Mac"
-            : "This agent doesn't report token counts"
+        supportsTokens ? "Today's tokens in, out, and total below the meters" : "This agent doesn't report token counts"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            let capNames = ProviderPaneLogic.modelCapNames(providerSnapshots)
-            let keys = usage?.keys(for: integration) ?? []
-            // One row per login the engine publishes — a deduplicated subscription is one row even
-            // when both an owned connection and a detected folder stand behind it. The Add row is
-            // reachable whether or not a CLI folder exists: the gate is the supported list (only
-            // login-capable providers are supported), not filesystem detection.
-            if !keys.isEmpty || login != nil {
-                SettingsGroup("Accounts", footer: accountsFooter) {
-                    ForEach(Array(keys.enumerated()), id: \.element) { index, key in
-                        if index > 0 { GlassDivider() }
-                        if let snapshot = usage?[key] {
-                            AccountRow(
-                                snapshot: snapshot, names: settings.settings.accountNames,
-                                owned: ownership(of: snapshot), login: login,
-                                integration: integration,
-                                onRename: snapshot.account.map { _ in { onRenameAccount(snapshot, integration) } }
-                            )
-                        }
-                    }
-                    if let login {
-                        if !keys.isEmpty { GlassDivider() }
-                        addAccountRow(login)
-                        if loginStatusVisible(login) {
-                            GlassDivider()
-                            LoginStatusView(integration: integration, controller: login)
-                        }
-                    }
-                }
-            }
+            let capNames = orderedUnique((usage?[integration]?.windows ?? []).compactMap { $0.kind.modelName })
             // Split by what the switch reaches, not by surface: Extra changes the ring, the "Notch
             // shows" options and the card's rows alike, so it sits with the provider-wide switches.
             SettingsGroup("Provider") {
@@ -353,8 +324,8 @@ private struct ProviderPane: View {
                 // preference the filesystem overrules.
                 SettingsRow("Enabled", subtitle: hint(integration)) {
                     SettingsToggle(isOn: settings.providerBind(integration, \.visible))
-                        .disabled(!providerAvailable)
-                        .opacity(providerAvailable ? 1 : 0.5)
+                        .disabled(!detected(integration))
+                        .opacity(detected(integration) ? 1 : 0.5)
                 }
                 if !capNames.isEmpty {
                     GlassDivider()
@@ -365,6 +336,81 @@ private struct ProviderPane: View {
                 GlassDivider()
                 notchShowsRow
             }
+            SettingsGroup("Data source") {
+                SettingsRow("Read usage from", subtitle: remote ? "Connects over SSH and refreshes on save." : "Reads this Mac's harness login.") {
+                    PopupControl(
+                        options: [("This Mac", false), ("Remote server", true)], selection: $remote,
+                        accessibilityLabel: "Usage data source"
+                    )
+                    .onChange(of: remote) { _, isRemote in
+                        if !isRemote { saveSource() }
+                    }
+                }
+                if remote {
+                    GlassDivider()
+                    SettingsRow("Remote server", subtitle: sourceSaved ? "Saved and refreshed." : "SSH alias or IP address") {
+                        TextField("sunny-new-direct or 100.112.44.46", text: $remoteServer)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 190)
+                            .onSubmit { saveSource() }
+                    }
+                }
+                GlassDivider()
+                SettingsRow("Token location", subtitle: "Directory containing this subscription's login.") {
+                    TextField("~/.claude-a", text: $tokenLocation)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 190)
+                        .onSubmit { saveSource() }
+                }
+                GlassDivider()
+                SettingsRow("", subtitle: remote ? "Uses the SSH user and keys configured on this Mac." : "Reads the login stored on this Mac.") {
+                    Button("Save and refresh") { saveSource() }
+                        .disabled(remote && remoteServer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if remote && (account.harness == .claude || account.harness == .codex) {
+                    GlassDivider()
+                    SettingsRow("Sign in", subtitle: "Runs the provider's login on this remote server.") {
+                        Button(remoteLogin.isRunning ? "Signing in…" : "Sign in on remote") {
+                            remoteLogin.start(account: currentAccount)
+                        }
+                        .disabled(remoteLogin.isRunning)
+                    }
+                    if !remoteLogin.output.isEmpty {
+                        GlassDivider()
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(remoteLogin.output)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(Color.csLabel)
+                                .textSelection(.enabled)
+                                .lineLimit(8)
+                            HStack {
+                                if let url = remoteLogin.browserURL {
+                                    Button("Open browser") { NSWorkspace.shared.open(url) }
+                                }
+                                if remoteLogin.isRunning { Button("Cancel") { remoteLogin.cancel() } }
+                            }
+                            if remoteLogin.isRunning {
+                                HStack(spacing: 8) {
+                                    TextField("Paste login code or token", text: $remoteLoginResponse)
+                                        .textFieldStyle(.roundedBorder)
+                                        .onSubmit { submitRemoteLoginResponse() }
+                                    Button("Send") { submitRemoteLoginResponse() }
+                                        .disabled(remoteLoginResponse.isEmpty)
+                                    Button("Paste & send") {
+                                        guard let value = NSPasteboard.general.string(forType: .string) else { return }
+                                        remoteLogin.submit(value)
+                                    }
+                                }
+                                Text("Sent directly to the remote CLI; it is not saved or shown in this transcript.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                    }
+                }
+            }
             SettingsGroup("Card") {
                 SettingsRow("Show token estimate", subtitle: tokenSubtitle) {
                     SettingsToggle(isOn: settings.providerBind(integration, \.showTokenEstimate))
@@ -372,34 +418,46 @@ private struct ProviderPane: View {
                         .opacity(supportsTokens ? 1 : 0.5)
                 }
             }
+            if canDelete {
+                Button("Delete subscription", role: .destructive) { onDeleteSubscription(integration) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(Color.csRed)
+            }
         }
     }
 
-    // Whether this reading stands on an app-owned connection, and the sources behind it. Read off
-    // the controller's secret-free snapshots by exact account id — never inferred from note prose.
-    private func ownership(of snapshot: UsageSnapshot) -> SubscriptionAccountSnapshot? {
-        guard let id = snapshot.account?.id else { return nil }
-        return login?.snapshot(integration: integration, accountID: id)
+    private func submitRemoteLoginResponse() {
+        remoteLogin.submit(remoteLoginResponse)
+        remoteLoginResponse = ""
     }
 
-    private func loginStatusVisible(_ login: AccountLoginController) -> Bool {
-        LoginStatusView(integration: integration, controller: login).isVisible
+    private func saveSource() {
+        let host = remote ? remoteServer : nil
+        sourceSaved =
+            AccountsFile.setHost(host, for: integration, at: Accounts.configuredURL)
+            && AccountsFile.setConfigDir(tokenLocation, for: integration, at: Accounts.configuredURL)
+        guard sourceSaved else { return }
+        Task { await onAccountSourceChanged(integration) }
     }
 
-    // Reachable with or without a CLI folder. The quiet full-width row disables itself while any
-    // login is active, and the existing status row below still owns waiting, cancel, and errors.
-    @ViewBuilder private func addAccountRow(_ login: AccountLoginController) -> some View {
-        AddAccountRow(enabled: login.canStartLogin) {
-            login.beginLogin(integration)
-        }
+    private var currentAccount: AccountConfig {
+        AccountConfig(
+            harness: account.harness, account: account.account, label: account.label,
+            host: remote ? .ssh(remoteServer) : .local, configDir: tokenLocation)
+    }
+
+    private func orderedUnique(_ names: [String]) -> [String] {
+        var seen: Set<String> = []
+        return names.filter { seen.insert($0).inserted }
     }
 
     // Which of this provider's meters its ring quotes.
     @ViewBuilder private var notchShowsRow: some View {
         SettingsRow("Notch shows") {
-            let snapshots = providerSnapshots
+            let snapshot = usage?[integration]
             let includingExtras = settings.settings.provider(for: integration).showExtraCaps
-            let options = UsageSelection.scopeOptions(snapshots, includingExtras: includingExtras)
+            let options = UsageSelection.scopeOptions(snapshot, includingExtras: includingExtras)
             let stored = settings.settings.provider(for: integration).scope
             if options.isEmpty {
                 PopupControl(
@@ -413,13 +471,12 @@ private struct ProviderPane: View {
                 // with no 5h window, or a cap the provider stopped reporting. The chip then
                 // names the option that renders the same window it fell back to, so the chip
                 // and the list it opens agree instead of reading "Weekly" over "Weekly · 7d".
-                let shown = snapshots.compactMap {
+                let shown = snapshot.flatMap {
                     UsageSelection.resolved($0, scope: stored, includingExtras: includingExtras)
-                }.first
-                let fallback = shown.flatMap { window in
-                    options.first { option in
-                        if case .window(let id) = option.scope { return id == window.id }
-                        return false
+                }
+                let fallback = snapshot.flatMap { snap in
+                    options.first {
+                        UsageSelection.resolved(snap, scope: $0.scope, includingExtras: includingExtras) == shown
                     }?.label
                 }
                 PopupControl(
@@ -458,218 +515,6 @@ extension SettingsStore {
     }
 }
 
-enum ProviderPaneLogic {
-    static func isAvailable(
-        detected: Bool, snapshots: [UsageSnapshot], accountRemembered: Bool
-    ) -> Bool {
-        detected || !snapshots.isEmpty || accountRemembered
-    }
-
-    static func hint(available: Bool, snapshots: [UsageSnapshot]) -> String? {
-        snapshots.compactMap(\.note).first ?? (available ? nil : "Not detected on this Mac")
-    }
-
-    static func modelCapNames(_ snapshots: [UsageSnapshot]) -> [String] {
-        var seen: Set<String> = []
-        return snapshots.flatMap(\.windows).compactMap(\.kind.modelName)
-            .filter { seen.insert($0).inserted }
-    }
-}
-
-// One login in a provider's Accounts group: its letter, its name, where it lives, which sources
-// stand behind it, and rename/reconnect/remove. A deduplicated subscription names both sources on
-// one row; removing the owned connection leaves the detected fallback in place (the Core keeps the
-// record while a detected source matches).
-struct AccountRow: View {
-    let snapshot: UsageSnapshot
-    let names: [String: String]
-    var owned: SubscriptionAccountSnapshot? = nil
-    var login: AccountLoginController? = nil
-    var integration: Integration = .claude
-    var onRename: (() -> Void)? = nil
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 11) {
-            if let account = snapshot.account {
-                AccountTile(
-                    letter: AccountLabel.letter(account, names: names), size: 28,
-                    muted: isDisconnected)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(isDisconnected ? Color.csLabel : Color.csTitle)
-                        .lineLimit(1)
-                    if let plan = snapshot.account.flatMap({ integration.planDisplayName($0.plan) }) {
-                        PlanChip(plan: plan)
-                    }
-                }
-                if let problem {
-                    Text(problem.text)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(problemColor(problem.tone))
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if !metadata.isEmpty {
-                    MetadataRow(items: metadata.map { Optional($0) }, font: .system(size: 10.5))
-                }
-            }
-            Spacer(minLength: 8)
-            if canReconnect {
-                DialogButton(title: "Reconnect", action: reconnect)
-                    .disabled(login?.canStartLogin == false)
-            }
-            if let onRename {
-                AccountActionsMenu(
-                    accountName: title, onRename: onRename,
-                    showReconnect: canReconnect,
-                    reconnectEnabled: login?.canStartLogin != false,
-                    removalLabel: removalLabel, onReconnect: reconnect, onRemove: remove)
-            }
-        }
-        .padding(.vertical, 9)
-        .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .frame(minHeight: 56)
-    }
-
-    private var title: String {
-        guard let account = snapshot.account else { return integration.displayName }
-        return AccountLabel.title(account, names: names)
-    }
-
-    private var metadata: [String] {
-        guard let account = snapshot.account else { return [] }
-        return AccountMetadata.settingsItems(account: account, title: title, sources: sources)
-    }
-
-    private var problem: AccountProblem? { AccountMetadata.problem(snapshot: snapshot) }
-    private var isDisconnected: Bool { snapshot.freshness == .disconnected }
-
-    private func problemColor(_ tone: AccountProblemTone) -> Color {
-        switch tone {
-        case .warning, .fallback, .disconnectedWarning: .csAmber
-        case .disconnected: .csFaint
-        }
-    }
-
-    private var sources: [UsageAccountSource] {
-        if !snapshot.accountSources.isEmpty { return snapshot.accountSources }
-        return owned?.sources ?? []
-    }
-
-    /// Reconnect targets only an owned connection with a current problem. Local-only rows never offer it.
-    private var canReconnect: Bool {
-        guard login != nil, snapshot.account != nil else { return false }
-        return AccountActionPolicy.canReconnect(
-            hasOwnedConnection: owned?.hasOwnedConnection == true, ownedStatus: owned?.status)
-    }
-
-    /// Removal always deletes only app-owned credentials. Its label says whether a recorded local
-    /// source keeps the account row alive afterward, even when that source is currently unavailable.
-    private var removalLabel: String? {
-        guard login != nil else { return nil }
-        return AccountActionPolicy.removalLabel(
-            hasOwnedConnection: owned?.hasOwnedConnection == true, sources: sources)
-    }
-
-    private func reconnect() {
-        guard let id = snapshot.account?.id else { return }
-        login?.reconnect(integration, accountID: id)
-    }
-
-    private func remove() {
-        guard let id = snapshot.account?.id else { return }
-        Task { await login?.remove(integration, accountID: id) }
-    }
-}
-
-// Variant A's single native menu. Borderless style and a custom label keep the trigger neutral and
-// chevron-free while preserving standard keyboard and accessibility behavior.
-private struct AccountActionsMenu: View {
-    let accountName: String
-    let onRename: () -> Void
-    let showReconnect: Bool
-    let reconnectEnabled: Bool
-    let removalLabel: String?
-    let onReconnect: () -> Void
-    let onRemove: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Menu {
-            Button(action: onRename) {
-                Label("Rename…", systemImage: "pencil")
-            }
-            if showReconnect {
-                Button(action: onReconnect) {
-                    Label("Reconnect", systemImage: "arrow.clockwise")
-                }
-                .disabled(!reconnectEnabled)
-            }
-            if let removalLabel {
-                Divider()
-                Button(role: .destructive, action: onRemove) {
-                    Label(removalLabel, systemImage: "trash")
-                }
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(hovering ? Color.csTitle : Color.csLabel)
-                .frame(width: 26, height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(hovering ? Color.csControlHover : .clear)
-                )
-                .contentShape(Rectangle())
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .pointerOnHover { hovering = $0 }
-        .animation(.easeInOut(duration: 0.12), value: hovering)
-        .accessibilityLabel("Actions for \(accountName)")
-        .help("Actions for \(accountName)")
-    }
-}
-
-private struct AddAccountRow: View {
-    let enabled: Bool
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 11) {
-                Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color.csLabel)
-                    .frame(width: 28, height: 28)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .strokeBorder(
-                                Color.csBorder,
-                                style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
-                    }
-                    .accessibilityHidden(true)
-                Text("Add account")
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(Color.csTitle)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 14)
-            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
-            .contentShape(Rectangle())
-            .background(hovering && enabled ? Color.csControlHover.opacity(0.35) : .clear)
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .opacity(enabled ? 1 : 0.5)
-        .pointerOnHover { hovering = $0 }
-    }
-}
-
 // MARK: - Grouped cards
 
 // The uppercase caption that names a section.
@@ -690,12 +535,10 @@ private struct SettingsCaption: View {
 // `GlassDivider`. The caption is optional, for a card whose rows already name themselves.
 private struct SettingsGroup<Content: View>: View {
     let caption: String?
-    var footer: String?
     @ViewBuilder var content: () -> Content
 
-    init(_ caption: String? = nil, footer: String? = nil, @ViewBuilder content: @escaping () -> Content) {
+    init(_ caption: String? = nil, @ViewBuilder content: @escaping () -> Content) {
         self.caption = caption
-        self.footer = footer
         self.content = content
     }
 
@@ -709,12 +552,6 @@ private struct SettingsGroup<Content: View>: View {
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
                         .strokeBorder(Color.csBorder, lineWidth: 1)
                 }
-            if let footer {
-                Text(footer)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(Color.csFaint)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
     }
 }

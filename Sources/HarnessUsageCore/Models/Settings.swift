@@ -37,16 +37,6 @@ public enum UsageLayout: String, Sendable { case linear, simple, dotMatrix, spot
 // When the hover card appears: as the pointer reaches a ring, or only once a ring is clicked.
 public enum CardTrigger: String, Sendable { case hover, click }
 
-// One global cadence for Claude/Codex local and subscription usage work. Closed choices keep the
-// persisted value and every source floor on the same supported policy.
-public enum UsageUpdateInterval: Int, Sendable, CaseIterable {
-    case oneMinute = 60
-    case fiveMinutes = 300
-    case fifteenMinutes = 900
-
-    public var seconds: TimeInterval { TimeInterval(rawValue) }
-}
-
 // One provider's complete configuration. Every detected provider gets a ring; `visible` toggles it.
 public struct ProviderConfig: Equatable, Sendable {
     public var visible: Bool  // the provider's ring is drawn on the notch
@@ -77,74 +67,51 @@ public struct Settings: Equatable, Sendable {
     public var warningAt: Double  // severity warning threshold (utilization %)
     public var criticalAt: Double  // severity critical threshold (utilization %)
     public var cardTrigger: CardTrigger
-    public var updateInterval: UsageUpdateInterval
 
     // The notch's size, as a multiplier on the design frame's own scale (1 = a 44pt ring).
     public var notchScale: Double
 
-    // The order the notch draws its rings in, as far as the user has said — one entry per login, so a
-    // second Claude account can be dragged on its own. Sparse, like `providers`: a ring missing from
-    // the list keeps its place behind the ones that are in it, so adding an Integration case or signing
-    // in to a new profile needs no migration and a ⌘-drag never has to name every ring.
-    public var providerOrder: [UsageKey]
+    // The order the notch draws its rings in, as far as the user has said. Sparse, like `providers`:
+    // a harness missing from the list keeps its place behind the ones that are in it, so adding an
+    // Integration case needs no migration and a ⌘-drag never has to name every provider.
+    public var providerOrder: [Integration]
 
     // Per-provider settings. Sparse by design — an absent entry means `ProviderConfig.defaults`, so
     // adding an Integration case needs no migration. Read it through `provider(for:)`, never by
-    // subscripting directly. Shared by every login of that harness.
+    // subscripting directly.
     public var providers: [Integration: ProviderConfig]
-
-    // Each account's assigned name, keyed by `UsageAccount.id`. New accounts receive their provider's
-    // automatic name; Settings can replace it with a manual rename.
-    public var accountNames: [String: String]
 
     // Integration presence is detected from the harness's home directory, never from a stored flag.
 
     public init(
         usageLayout: UsageLayout, warningAt: Double, criticalAt: Double,
-        cardTrigger: CardTrigger = .hover, updateInterval: UsageUpdateInterval = .fiveMinutes,
-        notchScale: Double = 1,
-        providerOrder: [UsageKey] = [], providers: [Integration: ProviderConfig] = [:],
-        accountNames: [String: String] = [:]
+        cardTrigger: CardTrigger = .hover, notchScale: Double = 1,
+        providerOrder: [Integration] = [], providers: [Integration: ProviderConfig] = [:]
     ) {
         self.usageLayout = usageLayout
         self.warningAt = warningAt
         self.criticalAt = criticalAt
         self.cardTrigger = cardTrigger
-        self.updateInterval = updateInterval
         self.notchScale = notchScale
         self.providerOrder = providerOrder
         self.providers = providers
-        self.accountNames = accountNames
     }
 
-    /// `keys` in the order the notch draws them: the ones the user has placed, in that order, then
-    /// everything else in the order it arrived.
+    /// `integrations` in the order the notch draws them: the ones the user has placed, in that
+    /// order, then everything else in the order it arrived.
     ///
-    /// A ring that is switched off or missing from this Mac drops out of the stored list the next time
-    /// the order is written, so it comes back at the end rather than in a slot the user can no longer
-    /// see — which is also what a newly detected harness or a newly signed-in profile does.
-    public func inNotchOrder(_ keys: [UsageKey]) -> [UsageKey] {
-        let placed = providerOrder.filter(keys.contains)
-        return placed + keys.filter { !placed.contains($0) }
+    /// A provider that is switched off or missing from this Mac drops out of the stored list the
+    /// next time the order is written, so it comes back at the end rather than in a slot the user
+    /// can no longer see — which is also what a newly detected harness does.
+    public func inNotchOrder(_ integrations: [Integration]) -> [Integration] {
+        let placed = providerOrder.filter(integrations.contains)
+        return placed + integrations.filter { !placed.contains($0) }
     }
 
     // One provider's configuration, defaulted. The stored dictionary is sparse — only providers the
     // user has actually customized have an entry — so every read goes through here.
     public func provider(for integration: Integration) -> ProviderConfig {
         providers[integration] ?? .defaults
-    }
-
-    // Assign every unnamed account its provider-derived name. Empty values count as unnamed, while a
-    // non-empty manual rename is never replaced.
-    @discardableResult public mutating func assignAutomaticAccountNames(_ accounts: [UsageAccount]) -> Bool {
-        var changed = false
-        for account in accounts {
-            let current = accountNames[account.id]?.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard current?.isEmpty != false else { continue }
-            accountNames[account.id] = account.suggestedName
-            changed = true
-        }
-        return changed
     }
 
     public static let defaults = Settings(

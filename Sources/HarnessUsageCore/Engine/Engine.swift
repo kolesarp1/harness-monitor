@@ -4,9 +4,8 @@ import Foundation
 // main actor. No AppKit. Fully integration-agnostic: holds a `[Integration: IntegrationMonitor]` and
 // iterates it. Detection is the only gate for a monitor.
 @MainActor public final class Engine {
-    private let monitors: [Integration: any IntegrationMonitor]
+    private var monitors: [Integration: any IntegrationMonitor]
     public let integrations: IntegrationStore?
-    public let accounts: SubscriptionAccountStore?
     public let usage: UsageStore
     public let settings: SettingsStore
     private let now: () -> Date
@@ -27,12 +26,9 @@ import Foundation
     private var pollDriven: Set<Integration> = []
     private var pollIntervals: [Integration: TimeInterval] = [:]
     private var lastReload: [Integration: Date] = [:]
-    private var lastSnapshots: [Integration: [String?: UsageSnapshot]] = [:]
+    private var lastSnapshots: [Integration: UsageSnapshot] = [:]
     private var lastHeartbeat: Date = .distantPast
     private var lastDetected: Set<Integration> = []
-    private var explicitlyDue: Set<Integration> = []
-    private var pendingDirty: Set<Integration> = []
-    private var configuredInterval: UsageUpdateInterval
     private let heartbeatInterval: TimeInterval = 60
 
     public init(
@@ -40,33 +36,20 @@ import Foundation
         usage: UsageStore,
         settings: SettingsStore,
         integrations: IntegrationStore? = nil,
-        accounts: SubscriptionAccountStore? = nil,
         now: @escaping () -> Date = { Date() }
     ) {
         self.monitors = monitors
         self.integrations = integrations
-        self.accounts = accounts
         self.usage = usage
         self.settings = settings
         self.now = now
-        self.configuredInterval = settings.settings.updateInterval
         settings.onUpdate = { [weak self] in self?.wake() }
-        if let accounts {
-            Task { [weak self] in
-                await accounts.setUpdateHandler { [weak self] integration in
-                    Task { @MainActor in
-                        self?.explicitlyDue.insert(integration)
-                        self?.wake()
-                    }
-                }
-            }
-        }
     }
 
     // Which integrations must reload this tick.
     //  - pollDue: poll-driven monitors whose own interval has elapsed.
-    //  - dirty roots: accumulated into `pendingDirty`, then reloaded when the global cadence is due.
-    //    The watcher's drain is destructive, so retaining the integration bit is mandatory.
+    //  - dirty roots: always honoured, on every tick. The watcher's drain is destructive, so an event
+    //    that arrives on a heartbeat tick must still be acted on here or it is gone.
     //  - heartbeat: additionally wake every detected monitor that is NOT poll-driven, for the
     //    time-driven bookkeeping (usage freshness, reset-time expiry).
     nonisolated static func dueIntegrations(
@@ -86,21 +69,6 @@ import Foundation
         return due.intersection(detected)
     }
 
-    nonisolated static func cadenceDecision(
-        candidates: Set<Integration>, pendingDirty: Set<Integration>, newlyDirty: Set<Integration>,
-        explicitlyDue: Set<Integration>, detected: Set<Integration>, lastReload: [Integration: Date],
-        now: Date, interval: TimeInterval, bypassAppCadence: Bool
-    ) -> (due: Set<Integration>, pendingDirty: Set<Integration>) {
-        let retainedDirty = pendingDirty.union(newlyDirty).intersection(detected)
-        let considered = candidates.union(retainedDirty).intersection(detected)
-        var due =
-            bypassAppCadence
-            ? detected
-            : Set(considered.filter { now.timeIntervalSince(lastReload[$0] ?? .distantPast) >= interval })
-        due.formUnion(explicitlyDue.intersection(detected))
-        return (due, retainedDirty.subtracting(due))
-    }
-
     public func wake() {
         if let watcher {
             watcher.signal()
@@ -109,10 +77,10 @@ import Foundation
         }
     }
 
-    // One pass: collect usage work, apply the global cadence, reload eligible monitors, merge with
-    // cached snapshots of the rest, and pump the store.
+    // One pass: refresh usage from the due monitors (event-dirty + always-polled + poll-interval
+    // elapsed, or all on the heartbeat), merge with the cached snapshots of the rest, pump the store.
     // A tick with nothing due returns without touching the store at all — that is the idle steady state.
-    public func tick(bypassAppCadence: Bool = false) async {
+    public func tick() async {
         let s = settings.settings
 
         if let integrations, now().timeIntervalSince(lastDetect) >= 30 {
@@ -120,114 +88,98 @@ import Foundation
             lastDetect = now()
         }
 
-        let filesystemDetected = integrations?.detected ?? Set(monitors.keys)
-        let accountAvailable = await accounts?.availableIntegrations() ?? []
-        let detected = filesystemDetected.union(accountAvailable)
+        let detected = integrations?.detected ?? Set(monitors.keys)
         let heartbeatDue = now().timeIntervalSince(lastHeartbeat) >= heartbeatInterval
-        let intervalChanged = configuredInterval != s.updateInterval
-        configuredInterval = s.updateInterval
         let pollDue = Set(
             pollDriven.filter { integration in
                 guard let interval = pollIntervals[integration] else { return false }
                 return now().timeIntervalSince(lastReload[integration] ?? .distantPast) >= interval
             })
-        let dirtyRoots = watcher?.drain() ?? []
-        let newlyDirty = Set(rootMap.compactMap { dirtyRoots.contains($0.root) ? $0.integration : nil })
-        var candidates = Engine.dueIntegrations(
-            dirtyRoots: [], rootMap: rootMap,
+        let due = Engine.dueIntegrations(
+            dirtyRoots: watcher?.drain() ?? [], rootMap: rootMap,
             alwaysPolled: alwaysPolled, pollDriven: pollDriven, pollDue: pollDue,
             heartbeat: heartbeatDue, detected: detected)
-        candidates.formUnion(detected.subtracting(lastDetected))
-        if intervalChanged { candidates.formUnion(detected) }
-        let cadence = integrations == nil && accounts == nil ? 0 : s.updateInterval.seconds
-        let decision = Engine.cadenceDecision(
-            candidates: candidates, pendingDirty: pendingDirty, newlyDirty: newlyDirty,
-            explicitlyDue: explicitlyDue, detected: detected, lastReload: lastReload,
-            now: now(), interval: cadence, bypassAppCadence: bypassAppCadence)
-        let due = decision.due
-        // Clear before awaiting monitors. New dirtiness/account updates arriving during this tick remain.
-        explicitlyDue.subtract(due)
-        pendingDirty = decision.pendingDirty
         if heartbeatDue { lastHeartbeat = now() }
         lastSnapshots = lastSnapshots.filter { detected.contains($0.key) }
         if detected != lastDetected {
             lastDetected = detected
-            publish(detected: detected)
+            let usageMap = lastSnapshots.filter { detected.contains($0.key) }
+            if usageMap != usage.byIntegration { usage.byIntegration = usageMap }
         }
         if due.isEmpty { return }
 
         // Concurrent monitor reload: all due monitors do their IO on their own actors in parallel,
         // so the main actor stays free to handle UI (window dragging, rendering) while waiting.
-        let results = await withTaskGroup(of: (Integration, [String?: UsageSnapshot]).self) { group in
+        let results = await withTaskGroup(of: (Integration, UsageSnapshot?).self) { group in
             for (integration, monitor) in monitors {
                 guard due.contains(integration) else { continue }
                 group.addTask(priority: .utility) {
-                    let want = s.provider(for: integration).showTokenEstimate
-                    let includeDetected = filesystemDetected.contains(integration)
                     guard PerfLog.enabled else {
-                        return (
-                            integration,
-                            await monitor.reloadProfiles(
-                                wantUsageEstimate: want, includeDetected: includeDetected,
-                                policy: UsageReloadPolicy(
-                                    interval: s.updateInterval,
-                                    bypassAppCadence: bypassAppCadence))
-                        )
+                        return (integration, await monitor.reload(wantUsageEstimate: s.provider(for: integration).showTokenEstimate))
                     }
                     let t0 = ContinuousClock.now
-                    let r = await monitor.reloadProfiles(
-                        wantUsageEstimate: want, includeDetected: includeDetected,
-                        policy: UsageReloadPolicy(
-                            interval: s.updateInterval,
-                            bypassAppCadence: bypassAppCadence))
+                    let r = await monitor.reload(wantUsageEstimate: s.provider(for: integration).showTokenEstimate)
                     let ms = PerfLog.ms(ContinuousClock.now - t0)
                     if ms > 5 { PerfLog.log(String(format: "monitor %@ reload %.1fms", "\(integration)", ms)) }
                     return (integration, r)
                 }
             }
-            var collected: [(Integration, [String?: UsageSnapshot])] = []
+            var collected: [(Integration, UsageSnapshot?)] = []
             for await item in group {
                 collected.append(item)
             }
             return collected
         }
         let stamp = now()
-        for (integration, readings) in results {
+        for (integration, snapshot) in results {
             lastReload[integration] = stamp
-            lastSnapshots[integration] = readings
+            lastSnapshots[integration] = snapshot
         }
 
-        publish(detected: detected)
-    }
-
-    // Every detected harness's logins, one reading each, written only when something actually changed.
-    private func publish(detected: Set<Integration>) {
-        var readings: [UsageKey: UsageSnapshot] = [:]
+        var usageMap: [Integration: UsageSnapshot] = [:]
         for integration in detected {
-            for (profile, snapshot) in lastSnapshots[integration] ?? [:] {
-                readings[UsageKey(integration, profile: profile)] = snapshot
-            }
+            if let snapshot = lastSnapshots[integration] { usageMap[integration] = snapshot }
         }
-        if readings != usage.readings { usage.readings = readings }
+
+        if usageMap != usage.byIntegration { usage.byIntegration = usageMap }
     }
 
     // "Update now": every detected monitor reads for real, right now.
     //
-    // App cadence has separate engine and monitor gates; manual refresh bypasses both and invalidates
-    // local scan floors, while server Retry-After holds remain authoritative. Detection runs first, so
-    // a harness installed since the last 30s sweep gets its ring on the same press. Awaits the tick it
-    // asks for, so a caller can hold a spinner up for exactly as long as the work takes.
+    // Three separate throttles stand between a press and a fresh number, and this drops all of them —
+    // each monitor's own refresh floor, the engine's per-monitor poll clock, and the heartbeat that
+    // decides which monitors a tick even asks. Detection runs first, so a harness installed since the
+    // last 30s sweep gets its ring on the same press. Awaits the tick it asks for, so a caller can
+    // hold a spinner up for exactly as long as the work takes.
     public func refreshNow() async {
         integrations?.refresh()
         lastDetect = now()
-        let filesystemDetected = integrations?.detected ?? Set(monitors.keys)
-        let detected = filesystemDetected.union(await accounts?.availableIntegrations() ?? [])
+        let detected = integrations?.detected ?? Set(monitors.keys)
         await withTaskGroup(of: Void.self) { group in
             for (integration, monitor) in monitors where detected.contains(integration) {
                 group.addTask(priority: .utility) { await monitor.invalidateThrottles() }
             }
         }
-        await tick(bypassAppCadence: true)
+        lastReload = [:]
+        lastHeartbeat = .distantPast
+        await tick()
+    }
+
+    /// Swap one account's monitor after its Settings source changes. The integration identity stays
+    /// the same, so rings and provider preferences remain intact; only the place its data is read
+    /// from changes. Rebuilding the watcher/poll schedule makes the replacement live immediately.
+    public func replaceMonitor(_ monitor: any IntegrationMonitor, for integration: Integration) async {
+        stop()
+        monitors[integration] = monitor
+        lastReload.removeValue(forKey: integration)
+        lastSnapshots.removeValue(forKey: integration)
+        usage.byIntegration.removeValue(forKey: integration)
+        pollDriven = []
+        pollIntervals = [:]
+        alwaysPolled = []
+        rootMap = []
+        start()
+        await refreshNow()
     }
 
     public func start() {

@@ -11,9 +11,10 @@ struct NotchUsageCard: View {
     let selection: ProviderSelection
     /// The Size setting the tail and its shape are drawn at — see `Design.multiplier`.
     let scale: CGFloat
+    let accounts: [Integration]
 
     var body: some View {
-        UsageSection(usage: usage, settings: settings, selection: selection)
+        UsageSection(usage: usage, settings: settings, selection: selection, accounts: accounts)
             .frame(width: NotchCardMetrics.cardWidth)
             // The tail sits beside the content, not over it: the body keeps its full width and the
             // silhouette grows by the tail's length toward the notch.
@@ -67,45 +68,44 @@ enum NotchCardMetrics {
             tipRadius: tailTipRadius, baseFillet: tailBaseFillet)
     }
 
-    /// The card's full height for one login, shadow ring included.
+    /// The card's full height for one provider, shadow ring included.
     ///
     /// Measuring costs a SwiftUI layout pass, so the answer is kept until one of the things it
-    /// depends on actually changes. Without the cache this runs once per login on every engine
+    /// depends on actually changes. Without the cache this runs once per provider on every engine
     /// tick; with it, only when a reading, a setting or the notch's size moves.
     static func height(
-        for reading: UsageKey, usage: UsageStore, settings: SettingsStore
+        for integration: Integration, usage: UsageStore, settings: SettingsStore,
+        accounts: [Integration]
     ) -> CGFloat {
         let key = Key(
-            snapshot: usage[reading], config: settings.settings.provider(for: reading.integration),
-            layout: settings.settings.usageLayout, multiplier: Design.multiplier,
-            accountNames: settings.settings.accountNames)
-        if let cached = cache[reading], cached.key == key { return cached.height }
+            snapshot: usage[integration], config: settings.settings.provider(for: integration),
+            layout: settings.settings.usageLayout, multiplier: Design.multiplier)
+        if let cached = cache[integration], cached.key == key { return cached.height }
 
         let selection = ProviderSelection()
-        selection.key = reading
+        selection.integration = integration
         let host = NSHostingView(
             rootView: NotchUsageCard(
-                usage: usage, settings: settings, selection: selection, scale: Design.multiplier))
+                usage: usage, settings: settings, selection: selection, scale: Design.multiplier,
+                accounts: accounts))
         host.frame = CGRect(x: 0, y: 0, width: totalWidth, height: 0)
         host.layoutSubtreeIfNeeded()
         let height = max(host.fittingSize.height, minHeight)
-        cache[reading] = (key, height)
+        cache[integration] = (key, height)
         return height
     }
 
     /// `multiplier` is in here because `totalWidth` — the width the card is measured at — is scaled by
     /// it. Without it the Size slider left every provider's height frozen at the previous scale's
-    /// measurement, and the panel reserved room for a card that is no longer that size. The snapshot
-    /// and assigned names also cover every input that changes the measured identity header.
+    /// measurement, and the panel reserved room for a card that is no longer that size.
     private struct Key: Equatable {
         let snapshot: UsageSnapshot?
         let config: ProviderConfig
         let layout: UsageLayout
         let multiplier: CGFloat
-        let accountNames: [String: String]
     }
 
-    private static var cache: [UsageKey: (key: Key, height: CGFloat)] = [:]
+    private static var cache: [Integration: (key: Key, height: CGFloat)] = [:]
 }
 
 /// The card's silhouette: a rounded rectangle with a tail on its trailing edge, its tip pointing at

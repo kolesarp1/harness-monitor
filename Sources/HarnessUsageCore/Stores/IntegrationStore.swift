@@ -1,28 +1,33 @@
 import Foundation
-import Observation
 
-// Which integrations are present on this machine. Drives Settings availability (a not-detected
-// integration shows a disabled "Not detected" toggle). Refreshed by the Engine on the main actor at
-// launch and on a ~30s cadence — the probe is a few `fileExists` checks, cheap enough for the tick.
+// Which of the configured accounts are actually present. Drives Settings availability (a
+// not-detected account shows a disabled "Not detected" toggle) and gates the Engine. Refreshed on the
+// main actor at launch and on a ~30s cadence — the probe is a few `fileExists` checks, cheap enough
+// for the tick.
 @MainActor @Observable public final class IntegrationStore {
     public var detected: Set<Integration>
     private let home: URL
+    private let accounts: [AccountConfig]
 
-    public init(home: URL, detected: Set<Integration> = []) {
+    public init(home: URL, accounts: [AccountConfig] = AccountsFile.defaults, detected: Set<Integration> = []) {
         self.home = home
+        self.accounts = accounts
         self.detected = detected
     }
 
-    // Detection is "does the tool's marker directory exist". The marker path is owned by the
-    // integration's descriptor, so there is no central switch to keep in step with the registry.
-    // Only supported integrations are probed: suspended cases keep their stored settings but are
-    // never detected, initialized or shown. Persistence still iterates `allCases` (see SettingsStore).
+    // Detection is "does this account's config directory exist on this Mac".
+    //
+    // A REMOTE account is always detected. Its directory is on another machine, and the only way to
+    // answer the question would be an ssh round trip on the 30s detection sweep — for a fact the
+    // monitor establishes anyway on its own next refresh, and reports as a note the user can read.
+    // Configuring a remote account is itself the statement that it exists.
     public func refresh() {
         let fm = FileManager.default
         let found = Set(
-            Integration.supportedCases.filter {
-                fm.fileExists(atPath: home.appendingPathComponent($0.descriptor.homeRelativePath).path)
-            })
+            accounts.filter { account in
+                account.host.isRemote
+                    || fm.fileExists(atPath: account.resolvedConfigDir(home: home))
+            }.map(\.integration))
         if found != detected { detected = found }  // only notify observers on an actual change
     }
 }

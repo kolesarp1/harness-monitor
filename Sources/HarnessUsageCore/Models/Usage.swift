@@ -1,18 +1,19 @@
 import Foundation
 
-public enum UsageSource: String, Sendable, Codable {
+public enum UsageSource: String, Sendable {
     case localEstimate  // auth-free token estimate, summed from the user's own on-disk transcripts
     case codexLocal  // Codex's own 5h/weekly rate-limit snapshot, read from ~/.codex rollout files
     case opencodeLocal  // opencode's per-session token columns (auth-free, no plan limit)
     case claudeOAuth  // Claude's real 5h/7-day usage %, read from the OAuth usage endpoint
     case cursorDashboard  // Cursor's monthly billing-cycle usage, read from its dashboard RPC
     case codexUsageAPI  // Codex's real 5h/weekly meters, read from the ChatGPT backend usage endpoint
+    case remote  // a harness's own live meters, fetched over ssh on the machine that account is on
 }
 
 // One metered window a provider reports. Nothing here is named after a plan shape: a provider
 // publishes the windows it has and every surface renders the list, so a plan with one weekly cap,
 // one with a 5h and a 7d, and one with a billing cycle need no Core concept of their own.
-public struct UsageWindow: Equatable, Sendable, Identifiable, Codable {
+public struct UsageWindow: Equatable, Sendable, Identifiable {
     /// Stable across renames and restarts, assigned by the monitor, never parsed by Core. A stored
     /// scope points at this, so a provider that renames a cap must not change it.
     public let id: String
@@ -27,7 +28,7 @@ public struct UsageWindow: Equatable, Sendable, Identifiable, Codable {
     // switch is on — spending one blocks that model, not the account. The name rides along because
     // the Settings row has to say "Show Fable", and only the monitor knows what the model is called;
     // Core must not go parsing it back out of an id or a window title.
-    public enum Kind: Sendable, Equatable, RawRepresentable, Codable {
+    public enum Kind: Sendable, Equatable, RawRepresentable {
         case account
         case model(String)
 
@@ -50,20 +51,6 @@ public struct UsageWindow: Equatable, Sendable, Identifiable, Codable {
             }
         }
 
-        public init(from decoder: any Decoder) throws {
-            let container = try decoder.singleValueContainer()
-            let raw = try container.decode(String.self)
-            guard let value = Kind(rawValue: raw) else {
-                throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid usage-window kind")
-            }
-            self = value
-        }
-
-        public func encode(to encoder: any Encoder) throws {
-            var container = encoder.singleValueContainer()
-            try container.encode(rawValue)
-        }
-
         public var isAccount: Bool { self == .account }
         public var modelName: String? {
             if case .model(let name) = self { return name }
@@ -84,69 +71,7 @@ public struct UsageWindow: Equatable, Sendable, Identifiable, Codable {
     }
 }
 
-// Which reading a snapshot is: a harness, and which of its logins. Most harnesses keep one login per
-// Mac and publish under `profile: nil`. Claude and Codex keep one login per config folder, so each
-// extra folder signed in to an account publishes under its own profile name beside the default.
-public struct UsageKey: Hashable, Sendable, Identifiable {
-    public let integration: Integration
-    public let profile: String?
-
-    public init(_ integration: Integration, profile: String? = nil) {
-        self.integration = integration
-        self.profile = profile
-    }
-
-    /// "claude" for a default login, "claude:work" for a profile — the spelling the ring order persists.
-    public init?(rawValue: String) {
-        let parts = rawValue.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-        guard let integration = Integration(rawValue: String(parts[0])) else { return nil }
-        if parts.count == 2 {
-            guard !parts[1].isEmpty else { return nil }
-            self.init(integration, profile: String(parts[1]))
-        } else {
-            self.init(integration)
-        }
-    }
-
-    public var rawValue: String { profile.map { "\(integration.rawValue):\($0)" } ?? integration.rawValue }
-    public var id: String { rawValue }
-}
-
-// Who a reading belongs to, for a harness that says. Claude reads it from its state file and Codex
-// from auth.json; harnesses that report none carry no identity line on their cards.
-public struct UsageAccount: Equatable, Sendable, Codable {
-    /// Stable identity of the login, and what a name the user gives it is stored against.
-    public let id: String
-    public let email: String?
-    /// The provider's nonempty plan value. Presentation applies that integration's display policy.
-    public let plan: String?
-    /// Where the login lives, home-relative: "~/.claude", "~/.claude-work".
-    public let location: String
-    /// The automatic account name: subscription profile, email local part, then config folder/provider.
-    public let suggestedName: String
-
-    public init(id: String, email: String?, plan: String?, location: String, suggestedName: String) {
-        self.id = id
-        self.email = email
-        self.plan = plan
-        self.location = location
-        self.suggestedName = suggestedName
-    }
-
-    // New accounts name themselves from the subscription profile, then the email's local part.
-    // The config-folder/provider fallback covers tokens that expose neither.
-    public static func automaticName(reportedName: String?, email: String?, fallback: String) -> String {
-        if let name = reportedName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-            return name
-        }
-        if let local = email?.split(separator: "@", maxSplits: 1).first.map(String.init), !local.isEmpty {
-            return local
-        }
-        return fallback
-    }
-}
-
-public struct UsageSnapshot: Equatable, Sendable, Codable {
+public struct UsageSnapshot: Equatable, Sendable {
     public var windows: [UsageWindow]
     public var localTokensToday: Int?
     // Tokens since the most recent local Monday 00:00 (`UsageMath.mostRecentMonday`) — a calendar week,
@@ -169,21 +94,15 @@ public struct UsageSnapshot: Equatable, Sendable, Codable {
     // Why a provider could not deliver what it was asked for (an expired token, an unreachable
     // endpoint). Surfaced in Settings so a tier that silently never fires names itself.
     public var note: String?
-    // The login these numbers belong to, when the harness names one.
-    public var account: UsageAccount?
-    // Explicit account state for rendering and source resolution. Existing monitor call sites default
-    // to a current detected reading; the account resolver fills all three fields precisely.
-    public var freshness: UsageFreshness
-    public var activeAccountSource: UsageActiveAccountSource?
-    public var accountSources: [UsageAccountSource]
+    /// The signed-in email when the harness stores it as non-secret login metadata. It is displayed
+    /// only in the hover card; tokens and account IDs are never surfaced.
+    public var accountEmail: String?
 
     public init(
         windows: [UsageWindow], localTokensToday: Int?, localTokensWeek: Int?, source: UsageSource,
         lastUpdated: Date, todayInput: Int? = nil, todayOutput: Int? = nil,
         costTodayUSD: Double? = nil, estimatedCostUSD: Double? = nil, note: String? = nil,
-        account: UsageAccount? = nil, freshness: UsageFreshness = .fresh,
-        activeAccountSource: UsageActiveAccountSource? = .detected,
-        accountSources: [UsageAccountSource] = []
+        accountEmail: String? = nil
     ) {
         self.windows = windows.enumerated()
             .sorted { a, b in
@@ -201,10 +120,7 @@ public struct UsageSnapshot: Equatable, Sendable, Codable {
         self.costTodayUSD = costTodayUSD
         self.estimatedCostUSD = estimatedCostUSD
         self.note = note
-        self.account = account
-        self.freshness = freshness
-        self.activeAccountSource = activeAccountSource
-        self.accountSources = accountSources
+        self.accountEmail = accountEmail
     }
 
     public func windows(includingExtras: Bool) -> [UsageWindow] {

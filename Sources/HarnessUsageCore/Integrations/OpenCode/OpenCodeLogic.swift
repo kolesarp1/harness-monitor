@@ -1,6 +1,6 @@
 import Foundation
 
-// Pure mapping from decoded opencode `session` rows to Harness Monitor's UsageSnapshot. No SQLite, no IO.
+// Pure mapping from decoded opencode `session` rows to Harness Usage's UsageSnapshot. No SQLite, no IO.
 // The monitor injects the rows, so this stays covered by the test suite. opencode stores timestamps as
 // epoch MILLISECONDS; `seconds(fromMS:)` normalizes them. opencode has no plan-level limit
 // (bring-your-own-provider), so usage reports absolute token totals rather than a utilization %.

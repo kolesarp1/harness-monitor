@@ -45,7 +45,7 @@ private func resolved(
         Integration.claude: snap(session: 40, week: 30),
         Integration.codex: snap(session: 70, week: 20),
     ]
-    let providers = UsageSelection.availableProviders(usage: usage, settings: settings)
+    let providers = UsageSelection.availableProviders(AccountsFile.defaultKeys, usage: usage, settings: settings)
     #expect(UsageSelection.chosenProvider(providers, usage: usage, settings: settings) == .codex)
 }
 
@@ -59,7 +59,7 @@ private func resolved(
         Integration.codex: tokenOnlySnapshot(),
     ]
 
-    #expect(UsageSelection.availableProviders(usage: usage, settings: settings) == [.codex])
+    #expect(UsageSelection.availableProviders(AccountsFile.defaultKeys, usage: usage, settings: settings) == [.codex])
 }
 
 @Test func urgentPicksTheHigherOfSessionAndWeek() {
@@ -127,11 +127,11 @@ private func resolved(
             localTokensToday: nil, localTokensWeek: nil, source: .codexUsageAPI, lastUpdated: .distantPast)
     ]
 
-    #expect(UsageSelection.availableProviders(usage: usage, settings: settings).isEmpty)
+    #expect(UsageSelection.availableProviders(AccountsFile.defaultKeys, usage: usage, settings: settings).isEmpty)
 
     codex.showExtraCaps = true
     settings.providers[.codex] = codex
-    #expect(UsageSelection.availableProviders(usage: usage, settings: settings) == [.codex])
+    #expect(UsageSelection.availableProviders(AccountsFile.defaultKeys, usage: usage, settings: settings) == [.codex])
 }
 
 @Test func aProviderWithOnlyModelWindowsIsAvailableWhenItsEstimateIsOn() {
@@ -140,7 +140,7 @@ private func resolved(
         localTokensToday: nil, localTokensWeek: nil, source: .codexUsageAPI, lastUpdated: .distantPast)
     let settings = Settings.defaults
 
-    #expect(UsageSelection.availableProviders(usage: [.codex: snapshot], settings: settings) == [.codex])
+    #expect(UsageSelection.availableProviders(AccountsFile.defaultKeys, usage: [.codex: snapshot], settings: settings) == [.codex])
 }
 
 @Test func mostUrgentTakesTheFullestCapWhenExtrasAreOn() {

@@ -21,11 +21,15 @@ final class NotchWindowController {
 
     private let usage: UsageStore
     private let settings: SettingsStore
+    // The tracked accounts, in `accounts.json` order — the card's fallback provider is picked from
+    // this list, so it has to be the app's real one and not a global read from inside a view.
+    private let accounts: [Integration]
     /// Which provider the hover card shows. `UsageSection` reads it and the hover logic writes it, so
     /// the ring under the pointer is the provider the card is about.
     private let selection = ProviderSelection()
 
-    init(usage: UsageStore, settings: SettingsStore) {
+    init(usage: UsageStore, settings: SettingsStore, accounts: [Integration]) {
+        self.accounts = accounts
         self.usage = usage
         self.settings = settings
     }
@@ -96,7 +100,7 @@ final class NotchWindowController {
         // A card index that survives the change may now be a different provider — a ring above it
         // was switched off — and the card must follow the ring, not the index.
         if let index = model.cardIndex {
-            syncSelection(to: providers[index].key)
+            syncSelection(to: providers[index].integration)
         }
         guard isShown else { return }
         if resized || panel == nil {
@@ -120,7 +124,8 @@ final class NotchWindowController {
             let panel = NotchPanel(contentRect: frame)
             let hosting = NotchHostingView(
                 rootView: NotchRootView(
-                    model: model, usage: usage, settings: settings, selection: selection))
+                    model: model, usage: usage, settings: settings, selection: selection,
+                    accounts: accounts))
             panel.contextMenuProvider = { [weak self] in self?.contextMenu() }
             panel.onClick = { [weak self] in self?.handleClick() }
             panel.onReorderBegan = { [weak self] in self?.beginReorder() ?? false }
@@ -470,7 +475,8 @@ final class NotchWindowController {
     /// Re-asserted on every pointer event, never pushed.
     ///
     /// A single `set()` from a non-frontmost app loses the race against the frontmost app's own
-    /// cursor writes, which is why `CursorArbiter` re-asserts on every mouse-move too. `push`/`pop` is worse: this panel's exits are advisory
+    /// cursor writes — the failure `docs/glass-widgets.md` documents, and the reason `CursorArbiter`
+    /// re-asserts on every mouse-move too. `push`/`pop` is worse: this panel's exits are advisory
     /// (the pointer can leave without an event landing here), and a dropped exit strands a pushed
     /// cursor on the stack forever. So: assert while over the target; on the way out restore the
     /// arrow ONCE, as the last setter, then go quiet rather than fighting other apps for a pointer
@@ -541,7 +547,7 @@ final class NotchWindowController {
             // was. The list holds only what is on the notch — a provider switched off or absent from
             // this Mac rejoins at the end, which is where a newly detected one arrives too.
             var settings = self.settings.settings
-            settings.providerOrder = list.map(\.key)
+            settings.providerOrder = list.map(\.integration)
             self.settings.update(settings)
             invalidateGeometry()
         }
@@ -609,7 +615,7 @@ final class NotchWindowController {
     /// list changes. The selection is set before the index, so the card already shows the right
     /// provider on the frame it appears — set after, it renders once with the previous one and swaps.
     private func showCard(at index: Int) {
-        syncSelection(to: model.snapshots[index].key)
+        syncSelection(to: model.snapshots[index].integration)
         guard model.cardIndex != index else { return }
         // Appearing and moving are different movements. Both writes sit in one transaction so the
         // new identity and the new index land in the same frame.
@@ -634,8 +640,8 @@ final class NotchWindowController {
 
     /// `ProviderSelection` is `@Observable`, so an unguarded write invalidates the card on every
     /// poll tick; only a real change goes through.
-    private func syncSelection(to key: UsageKey) {
-        if selection.key != key { selection.key = key }
+    private func syncSelection(to provider: Integration) {
+        if selection.integration != provider { selection.integration = provider }
     }
 
     private func cellIndex(along: CGFloat) -> Int? {
@@ -691,7 +697,7 @@ final class NotchWindowController {
         menu.addItem(settings)
         menu.addItem(.separator())
         menu.addItem(
-            withTitle: "Quit Harness Monitor", action: #selector(NSApplication.terminate(_:)),
+            withTitle: "Quit Harness Usage", action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         ).isEnabled = true
         return menu

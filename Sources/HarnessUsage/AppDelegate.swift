@@ -6,8 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var engine: Engine?
     private var windows: WindowManager?
     private var notch: NotchWindowController?
-    private var accountNames: AccountNamePrompt?
-    private var login: AccountLoginController?
+    // The tracked accounts, in `accounts.json` order — the list every surface draws from.
+    private var accounts: [Integration] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Every surface is dark glass, so the app is dark — pinned once here, before any window
@@ -23,38 +23,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Mock mode backs the settings store with a throwaway UserDefaults suite, wiped at launch, so
         // faking every integration on never writes into the user's real preferences (.standard).
         let defaults = isMock ? Self.mockDefaults() : .standard
-        let settings = SettingsStore(defaults: defaults)
-        let integrationStore = IntegrationStore(home: home)
+
+        // The tracked accounts — one ring each — from `~/.harness-usage/accounts.json`, seeded on a
+        // first launch with one local account per harness. Everything downstream is keyed by account,
+        // so this list is the app's shape.
+        if !isMock { AccountsFile.seedIfAbsent(at: Accounts.configuredURL) }
+        let accounts = isMock ? AccountsFile.defaults : Accounts.configured
+
+        let settings = SettingsStore(defaults: defaults, accounts: accounts.map(\.integration))
+        let integrationStore = IntegrationStore(home: home, accounts: accounts)
 
         if !isMock {
             integrationStore.refresh()
             Self.ensureMeta(home: home)
         }
 
-        // One subscription store for the process, shared by the engine and Settings. Mock mode stays
-        // isolated: no store, no account monitors, so a mock run never touches ~/.harness-usage.
-        let accounts: SubscriptionAccountStore? = isMock ? nil : SubscriptionAccountStore(home: home)
-
-        // The monitor map is built generically off the per-integration descriptors — adding an agent
-        // (a new case + folder + registry line) needs no change here. Mock mode swaps in MockMonitor.
-        // Only supported integrations are initialized: suspended cases keep their code and stored
-        // settings but get no monitor, so the engine never reads their credentials. Real monitors
-        // are wrapped so an app-owned connection is preferred over its matching detected folder.
+        // The monitor map is built generically off the per-harness descriptors — adding an agent
+        // (a new case + folder + registry line) needs no change here, and neither does adding an
+        // account. Mock mode swaps in MockMonitor.
         let monitors: [Integration: any IntegrationMonitor]
         if isMock {
             let mockDir = Self.mockDataDir()
             monitors = Dictionary(
                 uniqueKeysWithValues:
-                    Integration.supportedCases.map { ($0, MockMonitor(integration: $0, mockDir: mockDir) as any IntegrationMonitor) })
+                    accounts.map {
+                        ($0.integration, MockMonitor(integration: $0.integration, mockDir: mockDir) as any IntegrationMonitor)
+                    })
         } else {
-            let store = accounts
-            monitors = Dictionary(
-                uniqueKeysWithValues: Integration.supportedCases.map {
-                    let detected = $0.descriptor.makeMonitor(home: home)
-                    // Non-nil outside mock: the store is created for every non-mock run above.
-                    return ($0, store?.makeMonitor(for: $0, detectedMonitor: detected) ?? detected)
-                })
+            monitors = makeMonitors(accounts: accounts, home: home)
         }
+        self.accounts = accounts.map(\.integration)
 
         // Mock passes integrations: nil so the Engine's 30s detection refresh never runs against the
         // real home directory. Every consumer of a nil store falls back to "all detected" — the Engine,
@@ -63,26 +61,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             monitors: monitors,
             usage: UsageStore(),
             settings: settings,
-            integrations: isMock ? nil : integrationStore,
-            accounts: accounts)
+            integrations: isMock ? nil : integrationStore)
 
         self.engine = engine
-        // The login controller owns the browser/listener lifecycle and the snapshot list. Mutations
-        // wake the engine through the store's own update handler; snapshot refresh rides the render
-        // loop (cheap, eventually consistent) so this delegate never races the engine's handler.
-        let login = AccountLoginController(accounts: accounts) { [weak self] in self?.render() }
-        self.login = login
-        if accounts != nil {
-            Task { await login.reload() }
-        }
-        let accountNames = AccountNamePrompt(settings: engine.settings)
-        self.accountNames = accountNames
         let windows = WindowManager(
             usage: engine.usage, settings: engine.settings, integrations: engine.integrations,
-            login: login,
-            onRenameAccount: { accountNames.rename($0, integration: $1) })
+            accounts: accounts,
+            onAccountSourceChanged: { [weak engine] integration in
+                guard let engine,
+                    let account = AccountsFile.load(at: Accounts.configuredURL)?.first(where: {
+                        $0.integration == integration
+                    })
+                else { return }
+                let monitor = account.harness.descriptor.makeMonitor(home: home, account: account)
+                await engine.replaceMonitor(monitor, for: integration)
+            },
+            onAddSubscription: { harness in
+                guard AccountsFile.addSubscription(harness: harness, at: Accounts.configuredURL) != nil else { return }
+                Self.relaunch()
+            },
+            onDeleteSubscription: { integration in
+                guard AccountsFile.removeSubscription(integration, at: Accounts.configuredURL) else { return }
+                Self.relaunch()
+            })
         self.windows = windows
-        let notch = NotchWindowController(usage: engine.usage, settings: engine.settings)
+        let notch = NotchWindowController(
+            usage: engine.usage, settings: engine.settings, accounts: self.accounts)
         notch.onOpenSettings = { windows.toggleSettings() }
         notch.onRefresh = { [weak engine] in await engine?.refreshNow() }
         self.notch = notch
@@ -94,6 +98,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--show-settings") { windows.toggleSettings() }
     }
 
+    private static func relaunch() {
+        let launch = NSWorkspace.OpenConfiguration()
+        launch.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: launch) { _, error in
+            guard error == nil else { return }
+            Task { @MainActor in NSApp.terminate(nil) }
+        }
+    }
+
     // MARK: notch
 
     // The notch is the app's only surface, so this is the whole render loop: watch the three stores it
@@ -101,7 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // so each pass re-arms itself.
     private func observe() {
         withObservationTracking {
-            _ = engine?.usage.readings
+            _ = engine?.usage.byIntegration
             _ = engine?.settings.settings
             _ = engine?.integrations?.detected
         } onChange: { [weak self] in
@@ -113,25 +126,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // Detection is the gate, exactly as it is for the Settings panes: a harness that is not on this Mac
-    // has no ring — unless a remembered subscription stands behind it, which is the account half of
-    // the union. Account-only providers show their account rings with no phantom default.
+    // has no ring. The data is handed over before the panel is shown, so it is sized for the list it
+    // will actually draw rather than placed empty and resized a frame later.
     private func render() {
         guard let engine, let notch else { return }
         // Before the providers are built: the card's measured size and the notch's own geometry both
         // read this, and a stale value would size the panel for the previous setting.
         Design.multiplier = engine.settings.settings.notchScale
         // Mock mode passes `integrations: nil`, so nothing detects anything there — fake them all in.
-        let detected = engine.integrations?.detected ?? Set(Integration.supportedCases)
-        let accountAvailable = login?.accountIntegrations ?? []
+        let detected = engine.integrations?.detected ?? Set(accounts)
         notch.apply(
             providers: NotchProvider.all(
-                usage: engine.usage, settings: engine.settings, detected: detected,
-                accountAvailable: accountAvailable))
+                accounts, usage: engine.usage, settings: engine.settings, detected: detected))
         notch.show()
-        accountNames?.review(engine.usage.readings)
-        if let login {
-            Task { await login.reload() }
-        }
     }
 
     // An accessory app has no Dock icon and no windows of its own, so re-launching it (double-clicking

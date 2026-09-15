@@ -45,13 +45,6 @@ enum NotchLayout {
     static var glyphSize: CGFloat { Design.px(46) }
     static var ringLabelGap: CGFloat { Design.px(26.9) }
 
-    // The account chip. Not in the design frame, which draws one ring per harness. 17pt at full size,
-    // its letter at the percent label's cap height less a quarter; the chip and its 2.5pt halo reach
-    // 6.5pt past the ring, which stays inside the body's 13pt margin and the 10pt gap above the label.
-    static var accountChipSize: CGFloat { Design.px(45) }
-    static var accountChipHalo: CGFloat { Design.px(6.5) }
-    static var accountChipOverhang: CGFloat { Design.px(17) }
-
     // The settings orb: it lives *below* the notch, not inside it. At rest only
     // an arc of its edge is drawn, tucked into the corner the bottom flare
     // makes; on hover the same circle fills in and takes a gear. One circle,

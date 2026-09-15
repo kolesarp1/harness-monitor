@@ -18,7 +18,7 @@ BUILD="${BUILD:-1}"
 # APP_NAME is the executable/module name (Contents/MacOS/, CFBundleExecutable, pkill -x);
 # DISPLAY_NAME is what the user sees (bundle name, dmg, volname).
 APP_NAME="HarnessUsage"
-DISPLAY_NAME="Harness Monitor"
+DISPLAY_NAME="Harness Usage"
 BUNDLE_ID="com.mikeben.harness-widget"
 OUT="build/${DISPLAY_NAME}.app"
 DMG="build/${DISPLAY_NAME}-${VERSION}.dmg"
@@ -35,16 +35,36 @@ swift format lint --strict --recursive Sources Tests
 # ── Tests ─────────────────────────────────────────────────────────────────────
 # Debug, single-arch, before the release build: `swift test` accepts neither the dual
 # `--arch arm64 --arch x86_64` pair nor `-c release` cleanly with @testable imports.
-echo "==> test"
-swift test
+#
+# SKIP_TESTS=1 is the escape hatch for a machine with only the Command Line Tools installed.
+# The suite is swift-testing, and CLT ships an incomplete copy of it — `Testing.framework` is
+# there but `_Testing_Foundation` is not — so `swift test` cannot run at all without Xcode.
+# It is deliberately loud, and deliberately not the default: a release built this way has had
+# nothing but the compiler and the linter look at it.
+if [[ "${SKIP_TESTS:-0}" == "1" ]]; then
+  echo "==> test SKIPPED (SKIP_TESTS=1) — nothing has verified this build's behaviour"
+else
+  echo "==> test"
+  swift test
+fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-echo "==> universal release build (${VERSION})"
-swift build -c release --arch arm64 --arch x86_64
+# NATIVE_ONLY=1 is the second Command-Line-Tools escape hatch. The dual-arch build is driven by
+# xcbuild, which only Xcode ships, so on a CLT-only machine the universal build cannot run at all.
+# A native build installs and runs perfectly well on THIS Mac; it simply is not the artifact to
+# hand to anyone else, which is why it is opt-in and says so.
+if [[ "${NATIVE_ONLY:-0}" == "1" ]]; then
+  echo "==> native-arch release build ($(uname -m), ${VERSION}) — not distributable to other Macs"
+  swift build -c release
+  BIN=".build/release/${APP_NAME}"
+else
+  echo "==> universal release build (${VERSION})"
+  swift build -c release --arch arm64 --arch x86_64
+  BIN=".build/apple/Products/Release/${APP_NAME}"
+fi
 
-BIN=".build/apple/Products/Release/${APP_NAME}"
-echo "==> verify universal slices"
-lipo -info "$BIN"   # expect: x86_64 arm64
+echo "==> verify slices"
+lipo -info "$BIN"   # universal expects: x86_64 arm64
 
 # ── Assemble .app bundle ─────────────────────────────────────────────────────
 echo "==> assemble ${OUT}"

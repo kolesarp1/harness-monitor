@@ -5,24 +5,25 @@ import Foundation
 public enum UsageSelection {
     // A provider offers tokens when its descriptor reports them and detection produced a snapshot.
     // The estimate setting can clear the counts, so populated `todayInput` cannot be the capability test.
-    // Suspended integrations are excluded: their code and stored settings remain, but they are never
-    // initialized or shown (see `Integration.supportedCases`).
+    //
+    // Driven by the snapshots themselves rather than a configured list: a key is in the map only
+    // because a monitor for that account reported, so the map already answers "which accounts exist".
     public static func offersTokens(usage: [Integration: UsageSnapshot]) -> Bool {
-        Integration.supportedCases.contains { integration in
-            integration.descriptor.reportsTokens && usage[integration] != nil
-        }
+        usage.keys.contains { $0.reportsTokens }
     }
 
+    /// `accounts` is the tracked account list, in the order the app lists them — the map alone cannot
+    /// supply an order, and two rings must not swap places between renders.
     public static func availableProviders(
-        usage: [Integration: UsageSnapshot], settings: Settings
+        _ accounts: [Integration], usage: [Integration: UsageSnapshot], settings: Settings
     ) -> [Integration] {
-        Integration.supportedCases.filter { integration in
+        accounts.filter { integration in
             let config = settings.provider(for: integration)
             let snapshot = usage[integration]
             // The same predicate the card's content uses, so a provider whose only windows are model
             // caps the Extra switch hides is not offered a row it would draw empty.
             if !(snapshot?.windows(includingExtras: config.showExtraCaps).isEmpty ?? true) { return true }
-            return config.showTokenEstimate && integration.descriptor.reportsTokens && snapshot != nil
+            return config.showTokenEstimate && integration.reportsTokens && snapshot != nil
         }
     }
 
@@ -66,23 +67,12 @@ public enum UsageSelection {
     public static func scopeOptions(
         _ snap: UsageSnapshot?, includingExtras: Bool
     ) -> [(label: String, scope: UsageScope)] {
-        scopeOptions(snap.map { [$0] } ?? [], includingExtras: includingExtras)
-    }
-
-    /// Provider-level scope choices are the union of its real account window shapes. This exposes
-    /// available cap names without inventing an aggregate utilization across accounts.
-    public static func scopeOptions(
-        _ snapshots: [UsageSnapshot], includingExtras: Bool
-    ) -> [(label: String, scope: UsageScope)] {
-        var seen: Set<UsageScope> = []
-        var options: [(label: String, scope: UsageScope)] = []
-        for snapshot in snapshots {
-            for window in snapshot.windows(includingExtras: includingExtras) {
-                let scope = UsageScope.window(window.id)
-                if seen.insert(scope).inserted { options.append((window.title, scope)) }
-            }
+        guard let snap else { return [] }
+        let visible = snap.windows(includingExtras: includingExtras)
+        var options = visible.map { (label: $0.title, scope: UsageScope.window($0.id)) }
+        if !visible.isEmpty {
+            options.append((label: "Most urgent", scope: .mostUrgent))
         }
-        if !options.isEmpty { options.append(("Most urgent", .mostUrgent)) }
         return options
     }
 }

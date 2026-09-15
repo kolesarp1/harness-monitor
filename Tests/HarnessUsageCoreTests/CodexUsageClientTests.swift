@@ -57,7 +57,7 @@ private func body(
     #expect(window(snap, id: "7d")?.utilization == 22)
 }
 
-// Defect: a percentage still on screen for a period that already reset.
+// Defect: a percentage still on screen for a period that already reset (the donor's shared rule).
 @Test func aWindowWhoseResetHasPassedIsDropped() throws {
     let data = body(primary: (41.5, now.addingTimeInterval(-60), 10_800), secondary: (22, in7d, 604_800))
     let snap = try #require(CodexUsageClient.snapshot(fromResponseData: data, now: now))

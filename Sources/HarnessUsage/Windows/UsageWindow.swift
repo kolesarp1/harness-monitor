@@ -1,11 +1,11 @@
 import HarnessUsageCore
 import SwiftUI
 
-// Which login the usage card shows. An observable of its own rather than view state: the notch
-// preselects the login whose ring the pointer is on, and a `@State` inside the view would survive
+// Which provider the usage card shows. An observable of its own rather than view state: the notch
+// preselects the provider whose ring the pointer is on, and a `@State` inside the view would survive
 // the root-view update and ignore it. nil → the card's own most-drained default.
 @MainActor @Observable final class ProviderSelection {
-    var key: UsageKey?
+    var integration: Integration?
 }
 
 // The Usage section: the account meters for one provider. Same data, four selectable looks (deck
@@ -17,32 +17,27 @@ struct UsageSection: View {
     let usage: UsageStore
     let settings: SettingsStore
     let selection: ProviderSelection
+    /// The tracked accounts, in `accounts.json` order. The card needs the ORDER as well as the set:
+    /// its fallback provider is picked from this list, and a set alone would let it change between
+    /// renders. Passed in rather than read from `Accounts`, so `--mock` draws the mock accounts.
+    let accounts: [Integration]
 
     var body: some View {
         // The ring under the pointer is the provider the card is about, whatever it has to show — a
         // signed-out provider gets its own empty state, never another provider's meters. Only with no
         // ring hovered (Settings previews, measurement before a hover) does the card fall back to the
         // most-drained provider that has something to report.
-        let shown = selection.key ?? defaultReadingKey
+        let shown =
+            selection.integration
+            ?? UsageSelection.chosenProvider(
+                UsageSelection.availableProviders(
+                    accounts, usage: usage.byIntegration, settings: settings.settings),
+                usage: usage.byIntegration, settings: settings.settings)
         content(shown: shown)
     }
 
-    private var defaultReadingKey: UsageKey? {
-        usage.readings.keys.filter {
-            settings.settings.provider(for: $0.integration).visible
-        }.max { left, right in
-            let leftConfig = settings.settings.provider(for: left.integration)
-            let rightConfig = settings.settings.provider(for: right.integration)
-            let leftValue =
-                usage[left].flatMap {
-                    UsageSelection.resolved($0, scope: leftConfig.scope, includingExtras: leftConfig.showExtraCaps)
-                }?.utilization ?? -1
-            let rightValue =
-                usage[right].flatMap {
-                    UsageSelection.resolved($0, scope: rightConfig.scope, includingExtras: rightConfig.showExtraCaps)
-                }?.utilization ?? -1
-            return leftValue < rightValue
-        }
+    private func snapshot(for i: Integration) -> UsageSnapshot? {
+        usage[i]
     }
 
     // The meters block on top (when the provider has real % data), optionally with the local
@@ -50,45 +45,30 @@ struct UsageSection: View {
     // no-plan provider (API-key Codex / opencode / signed-out Claude) is blank with a prompt to enable
     // it, instead of silently showing tokens the user opted out of. The estimated $ is passed only
     // alongside meters: a subscription's flat fee isn't comparable to API list price.
-    @ViewBuilder private func content(shown: UsageKey?) -> some View {
+    @ViewBuilder private func content(shown: Integration?) -> some View {
         if let shown {
-            let snap = usage[shown]
-            let provider = settings.settings.provider(for: shown.integration)
+            let snap = snapshot(for: shown)
+            let provider = settings.settings.provider(for: shown)
             let hasMeters = !(snap?.windows(includingExtras: provider.showExtraCaps).isEmpty ?? true)
             let hasTokens = (snap?.todayInput != nil) && (snap?.todayOutput != nil)
             let showTokens = hasTokens && provider.showTokenEstimate
-            // Explicit freshness, never parsed prose: only a disconnected snapshot (no current
-            // source) gets the stale projection. A fallback reading is live detected numbers.
-            let stale = snap?.freshness == .disconnected
             VStack(spacing: 0) {
-                if let account = snap?.account {
-                    // The header carries the last reading's age while stale — a TimelineView so the
-                    // line stays truthful without a tick, at a 60s cadence the card cache ignores.
-                    if stale, let snapshot = snap {
-                        TimelineView(.periodic(from: .now, by: 60)) { ctx in
-                            AccountHeader(
-                                account: account, integration: shown.integration,
-                                names: settings.settings.accountNames,
-                                stateLine: AccountMetadata.statusText(snapshot: snapshot, now: ctx.date)
-                            )
-                        }
-                    } else {
-                        AccountHeader(
-                            account: account, integration: shown.integration,
-                            names: settings.settings.accountNames)
-                    }
-                    GlassDivider()
+                if shown.harness == .claude || shown.harness == .codex,
+                    let account = Accounts.config(for: shown)
+                {
+                    AccountIdentityRow(
+                        account: snap?.accountEmail ?? account.label,
+                        source: account.host.sshAlias ?? "This Mac")
+                    if hasMeters || showTokens { GlassDivider() }
                 }
                 if hasMeters {
-                    meters(snap, for: shown.integration)
+                    meters(snap, for: shown)
                     if showTokens {
                         GlassDivider()
                         TokenEstimateStrip(snapshot: snap)
                     }
                 } else if showTokens {
                     TokenEstimateStrip(snapshot: snap)
-                } else if stale {
-                    StaleEmpty(snapshot: snap)
                 } else {
                     EmptyUsage()
                 }
@@ -111,9 +91,9 @@ struct UsageSection: View {
     // detected Claude always "offers" tokens — without this it would flip from the prompt to a
     // misleading "unavailable" once the first gated refresh clears the totals.
     private var tokenEstimateDisabledProviderNames: [String] {
-        Integration.supportedCases.compactMap { integration in
-            guard usage.keys(for: integration).isEmpty == false,
-                integration.descriptor.reportsTokens,
+        accounts.compactMap { integration -> String? in
+            guard usage.byIntegration[integration] != nil,
+                integration.reportsTokens,
                 !settings.settings.provider(for: integration).showTokenEstimate
             else { return nil }
             return integration.displayName
@@ -125,14 +105,7 @@ struct UsageSection: View {
     }
 
     private func someDetectedOffersTokens() -> Bool {
-        Integration.supportedCases.contains { integration in
-            guard integration.descriptor.reportsTokens else { return false }
-            return usage.keys(for: integration).contains { key in
-                let snapshot = usage[key]
-                return snapshot?.todayInput != nil || snapshot?.todayOutput != nil
-                    || integration == .claude
-            }
-        }
+        UsageSelection.offersTokens(usage: usage.byIntegration)
     }
 
     // The meters block. Linear/simple/dotMatrix share ONE view type (MeterRows) so SwiftUI never sees
@@ -145,19 +118,46 @@ struct UsageSection: View {
         let criticalAt = settings.settings.criticalAt
         let layout = settings.settings.usageLayout
         let showExtraCaps = settings.settings.provider(for: shown).showExtraCaps
-        // One projection for every layout: the ring's `isStale` and these rows read the same flag,
-        // so a ring and the card it opens cannot quote different numbers for one harness.
-        let stale = snap?.freshness == .disconnected
         switch layout {
         case .spotlight:
             let spotlight = snap?.spotlightRows(showingExtras: showExtraCaps)
             SpotlightMeters(
                 hero: spotlight?.hero, compact: spotlight?.compact ?? [],
-                warningAt: warningAt, criticalAt: criticalAt, stale: stale)
+                warningAt: warningAt, criticalAt: criticalAt)
         default:
             MeterRows(
                 rows: snap?.windows(includingExtras: showExtraCaps) ?? [], warningAt: warningAt,
-                criticalAt: criticalAt, layout: layout, stale: stale)
+                criticalAt: criticalAt, layout: layout)
+        }
+    }
+}
+
+// Login identity is deliberately a quiet line in the hover card: it confirms which subscription the
+// meters belong to without competing with the limits themselves.
+private struct AccountIdentityRow: View {
+    let account: String
+    let source: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                identityLine(label: "Account", value: account.isEmpty ? "Default" : account)
+                identityLine(label: "Source", value: source)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func identityLine(label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.system(size: 11)).foregroundStyle(Color.csFaint)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.csLabel)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 }
@@ -229,25 +229,6 @@ private struct TokenEstimateStrip: View {
     }
 }
 
-// A disconnected account with nothing drawable: the snapshot note (the Core copies the account
-// status there — reconnect, rate-limit) when it names the cause, otherwise the shared empty line.
-// Never a fabricated 0%.
-private struct StaleEmpty: View {
-    let snapshot: UsageSnapshot?
-
-    var body: some View {
-        if let snapshot, let note = snapshot.note, !note.isEmpty {
-            TimelineView(.periodic(from: .now, by: 60)) { ctx in
-                CompactEmptyState(
-                    label: "\(note) · Last reading \(AccountAge.text(since: snapshot.lastUpdated, now: ctx.date))"
-                )
-            }
-        } else {
-            EmptyUsage()
-        }
-    }
-}
-
 // Shown when no provider reports usage yet (signed out, or before the first request).
 private struct EmptyUsage: View {
     var body: some View {
@@ -262,24 +243,6 @@ private struct TokenEstimateDisabled: View {
 
     var body: some View {
         CompactEmptyState(label: "Turn on Show token estimate for \(names.formatted(.list(type: .and)))")
-    }
-}
-
-// One stale projection shared by all four meter layouts (concept E). A live snapshot draws every
-// window in its severity colour. A disconnected snapshot draws old numbers grey — never a severity
-// colour on a number the app did not just measure — and a window whose reset has passed since the
-// last reading draws as "Reset" with no percent: the one honest thing a frozen reading can say.
-// Unknown-reset windows stay visibly stale rather than silently live.
-// How one window renders under the stale projection: live numbers, an old number in grey, or a
-// reset-passed window with no percent at all. Shared by MeterRows and both Spotlight rows so the
-// four layouts cannot disagree.
-enum StaleWindowStyle {
-    enum Projection: Equatable { case live, staleValue, resetPassed }
-
-    static func projection(window: UsageWindow, stale: Bool, now: Date = Date()) -> Projection {
-        guard stale else { return .live }
-        if let reset = window.resetsAt, reset <= now { return .resetPassed }
-        return .staleValue
     }
 }
 
@@ -357,8 +320,6 @@ private struct MeterRows: View {
     let warningAt: Double
     let criticalAt: Double
     let layout: UsageLayout
-    /// No current source works: old numbers draw grey, reset-passed windows read "Reset".
-    var stale: Bool = false
 
     private var isSimple: Bool { layout == .simple }
     private var isDotMatrix: Bool { layout == .dotMatrix }
@@ -379,7 +340,6 @@ private struct MeterRows: View {
     @ViewBuilder private func row(_ named: UsageWindow) -> some View {
         let util = named.utilization
         let level = UsageStyle.level(util, warningAt: warningAt, criticalAt: criticalAt)
-        let projection = StaleWindowStyle.projection(window: named, stale: stale)
         VStack(alignment: .leading, spacing: 9) {
             if !isSimple {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -388,26 +348,13 @@ private struct MeterRows: View {
                         Text(caption).font(.system(size: 11)).foregroundStyle(Color.csFaint)
                     }
                     Spacer(minLength: 8)
-                    switch projection {
-                    case .live:
-                        Text("\(UsageFormat.percent(util))%")
-                            .font(.system(size: isDotMatrix ? 15 : 17, weight: .bold, design: .monospaced))
-                            .foregroundStyle(UsageStyle.color(level))
-                    case .staleValue:
-                        Text("\(UsageFormat.percent(util))%")
-                            .font(.system(size: isDotMatrix ? 15 : 17, weight: .bold, design: .monospaced))
-                            .foregroundStyle(Color.csFaint)
-                    case .resetPassed:
-                        Text("Reset")
-                            .font(.system(size: isDotMatrix ? 15 : 17, weight: .bold))
-                            .foregroundStyle(Color.csFaint)
-                    }
+                    Text("\(UsageFormat.percent(util))%")
+                        .font(.system(size: isDotMatrix ? 15 : 17, weight: .bold, design: .monospaced))
+                        .foregroundStyle(UsageStyle.color(level))
                 }
             }
-            ProgressBar(
-                fraction: projection == .resetPassed ? 0 : min(1, max(0, util / 100)),
-                level: level, variant: barVariant, stale: stale)
-            if !isSimple, projection != .resetPassed {
+            ProgressBar(fraction: min(1, max(0, util / 100)), level: level, variant: barVariant)
+            if !isSimple {
                 ResetLine(usage: named, size: isDotMatrix ? 10.5 : 11)
             }
         }
@@ -436,8 +383,6 @@ private struct ProgressBar: View {
     let fraction: CGFloat
     let level: UsageLevel
     let variant: Variant
-    /// Stale bars draw in grey: severity colour would claim a fresh measurement.
-    var stale: Bool = false
 
     var body: some View {
         switch variant {
@@ -445,26 +390,21 @@ private struct ProgressBar: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.csWell)
-                    Group {
-                        if stale {
-                            Capsule().fill(Color.csFaint.opacity(0.45))
-                        } else {
-                            Capsule().fill(
-                                LinearGradient(
-                                    colors: UsageStyle.gradient(level), startPoint: .leading,
-                                    endPoint: .trailing))
-                        }
-                    }
-                    .frame(width: max(0, geo.size.width * fraction))
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: UsageStyle.gradient(level), startPoint: .leading, endPoint: .trailing)
+                        )
+                        .frame(width: max(0, geo.size.width * fraction))
                 }
             }
             .frame(height: height)
-            .modifier(CriticalGlow(active: level == .critical && !stale, color: .csCrit))
+            .modifier(CriticalGlow(active: level == .critical, color: .csCrit))
         case .dotMatrix:
             let side: CGFloat = 9
             let gap: CGFloat = 3
             Canvas { gc, size in
-                let fillColor = stale ? Color.csFaint.opacity(0.45) : UsageStyle.color(level)
+                let fillColor = UsageStyle.color(level)
                 let spacing = side + gap
                 let cols = max(1, Int((size.width + gap) / spacing))
                 let gridW = CGFloat(cols) * side + CGFloat(cols - 1) * gap
@@ -494,8 +434,6 @@ private struct SpotlightMeters: View {
     let compact: [UsageWindow]
     let warningAt: Double
     let criticalAt: Double
-    /// No current source works: old numbers draw grey, reset-passed windows read "Reset".
-    var stale: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -511,23 +449,19 @@ private struct SpotlightMeters: View {
         let window = hero
         let util = window?.utilization ?? 0
         let level = UsageStyle.level(util, warningAt: warningAt, criticalAt: criticalAt)
-        let projection = window.map { StaleWindowStyle.projection(window: $0, stale: stale) } ?? .live
+        let severity = UsageStyle.color(level)
         return VStack(alignment: .leading, spacing: 13) {
             HStack(alignment: .center, spacing: 14) {
-                stalePercent(util, hasData: window != nil, projection: projection, value: 46, unit: 24)
+                bigPercent(util, hasData: window != nil, color: severity, value: 46, unit: 24)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("\(hero?.title ?? "Usage") limit")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(Color.csLabel)
-                    if projection != .resetPassed {
-                        ResetLine(usage: window, size: 10.5)
-                    }
+                    ResetLine(usage: window, size: 10.5)
                 }
                 Spacer(minLength: 0)
             }
-            ProgressBar(
-                fraction: projection == .resetPassed ? 0 : min(1, max(0, util / 100)), level: level,
-                variant: .capsule(height: 6), stale: stale)
+            ProgressBar(fraction: min(1, max(0, util / 100)), level: level, variant: .capsule(height: 6))
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -536,49 +470,21 @@ private struct SpotlightMeters: View {
     private func compactRow(_ row: UsageWindow) -> some View {
         let util = row.utilization
         let level = UsageStyle.level(util, warningAt: warningAt, criticalAt: criticalAt)
-        let projection = StaleWindowStyle.projection(window: row, stale: stale)
+        let severity = UsageStyle.color(level)
         return HStack(spacing: 12) {
-            stalePercent(util, hasData: true, projection: projection, value: 28, unit: 15)
+            bigPercent(util, hasData: true, color: severity, value: 28, unit: 15)
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.title)
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(Color.csTitle)
-                if projection != .resetPassed {
-                    ResetLine(usage: row, size: 10)
-                }
+                ResetLine(usage: row, size: 10)
             }
             Spacer(minLength: 8)
-            ProgressBar(fraction: projection == .resetPassed ? 0 : min(1, max(0, util / 100)), level: level, variant: .capsule(height: 5), stale: stale)
+            ProgressBar(fraction: min(1, max(0, util / 100)), level: level, variant: .capsule(height: 5))
                 .frame(width: 80)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-    }
-
-    // The big number with a smaller "%" glyph beside it. Live numbers take the severity color and
-    // "—" means no data; on a stale reading old numbers print grey and a reset-passed window reads
-    // "Reset" with no percent.
-    @ViewBuilder private func stalePercent(
-        _ util: Double, hasData: Bool, projection: StaleWindowStyle.Projection, value: CGFloat,
-        unit: CGFloat
-    ) -> some View {
-        if projection == .resetPassed, hasData {
-            Text("Reset")
-                .font(.system(size: value * 0.55, weight: .bold))
-                .foregroundStyle(Color.csFaint)
-        } else if hasData {
-            let color: Color =
-                projection == .live
-                ? UsageStyle.color(UsageStyle.level(util, warningAt: warningAt, criticalAt: criticalAt))
-                : .csFaint
-            (Text(UsageFormat.percent(util)).font(.system(size: value, weight: .bold, design: .monospaced))
-                + Text("%").font(.system(size: unit, weight: .bold, design: .monospaced)))
-                .foregroundStyle(color)
-        } else {
-            Text("—")
-                .font(.system(size: value, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.csFaint)
-        }
     }
 
     // The big number with a smaller "%" glyph beside it, both in the severity color. "—" when no data.

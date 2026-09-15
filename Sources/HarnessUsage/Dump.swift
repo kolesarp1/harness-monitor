@@ -8,39 +8,35 @@ import HarnessUsageCore
 func runDump() async {
     let home = FileManager.default.homeDirectoryForCurrentUser
     let isMock = CommandLine.arguments.contains("--mock")
-    let integrationStore = IntegrationStore(home: home)
+    let accounts = isMock ? AccountsFile.defaults : Accounts.configured
+    let keys = accounts.map(\.integration)
+    let integrationStore = IntegrationStore(home: home, accounts: accounts)
 
-    // Built generically off the descriptors (mirrors AppDelegate). Only supported integrations are
-    // initialized; suspended cases keep their code and stored settings but get no monitor.
-    // Non-mock runs wrap each monitor with the shared subscription store, like the app.
-    let accounts: SubscriptionAccountStore? = isMock ? nil : SubscriptionAccountStore(home: home)
+    // Built generically off the descriptors, per account (mirrors AppDelegate).
     let monitors: [Integration: any IntegrationMonitor]
     if isMock {
         let mockDir = AppDelegate.mockDataDir()
         monitors = Dictionary(
             uniqueKeysWithValues:
-                Integration.supportedCases.map { ($0, MockMonitor(integration: $0, mockDir: mockDir) as any IntegrationMonitor) })
+                keys.map { ($0, MockMonitor(integration: $0, mockDir: mockDir) as any IntegrationMonitor) })
     } else {
-        monitors = Dictionary(
-            uniqueKeysWithValues: Integration.supportedCases.map {
-                let detected = $0.descriptor.makeMonitor(home: home)
-                return ($0, accounts?.makeMonitor(for: $0, detectedMonitor: detected) ?? detected)
-            })
+        monitors = makeMonitors(accounts: accounts, home: home)
     }
 
     let engine = Engine(
         monitors: monitors,
         usage: UsageStore(),
-        settings: SettingsStore(defaults: isMock ? AppDelegate.mockDefaults() : .standard),
-        integrations: isMock ? nil : integrationStore,
-        accounts: accounts)
+        settings: SettingsStore(
+            defaults: isMock ? AppDelegate.mockDefaults() : .standard, accounts: keys),
+        integrations: isMock ? nil : integrationStore)
 
     await engine.tick()
 
     // Mock passes `integrations: nil`, so nothing is probed on disk — every integration is faked in,
     // the same fallback the app's own render path takes.
-    let detected = isMock ? Set(Integration.supportedCases) : integrationStore.detected
-    print("=== Harness Monitor --dump ===")
+    let detected = isMock ? Set(keys) : integrationStore.detected
+    print("=== Harness Usage --dump ===")
+    print("accounts: \(keys.map(\.rawValue).joined(separator: ", "))")
     print("detected: \(detected.map(\.rawValue).sorted().joined(separator: ", "))")
     func fallback(_ s: UsageSnapshot?) -> String {
         guard let i = s?.todayInput, let o = s?.todayOutput else { return "fallback=—" }
@@ -61,26 +57,10 @@ func runDump() async {
     func cost(_ s: UsageSnapshot?) -> String {
         "cost[today=\(s?.costTodayUSD.map { String(format: "$%.4f", $0) } ?? "—") estimate=\(s?.estimatedCostUSD.map { String(format: "$%.4f", $0) } ?? "—")]"
     }
-    func account(_ s: UsageSnapshot?) -> String {
-        guard let a = s?.account else { return "account=—" }
-        return "account[\(a.email ?? "—") plan=\(a.plan ?? "—") at=\(a.location)]"
-    }
-    func freshness(_ s: UsageSnapshot?) -> String {
-        guard let s else { return "freshness=—" }
-        let active = s.activeAccountSource.map(\.rawValue) ?? "—"
-        let sources = s.accountSources.map { "\($0.kind.rawValue):\($0.reference)\($0.isAvailable ? "" : "!")" }.joined(separator: ",")
-        return "freshness=\(s.freshness.rawValue) active=\(active) sources=[\(sources)]"
-    }
-    for integration in Integration.supportedCases {
-        // All published logins (account keys carry the subscription id as their profile), with the
-        // default first for a stable order. Account-only providers have no default reading.
-        let published = engine.usage.keys(for: integration)
-        let ordered = published.contains(UsageKey(integration)) ? published : [UsageKey(integration)] + published
-        for key in ordered {
-            let snap = engine.usage[key]
-            print(
-                "\(key.rawValue) usage: \(account(snap)) source=\(snap?.source.rawValue ?? "none") \(rows(snap)) \(tokens(snap)) \(cost(snap)) \(fallback(snap)) \(age(snap)) \(freshness(snap)) \(note(snap))")
-        }
+    for integration in keys {
+        let snap = engine.usage[integration]
+        print(
+            "\(integration.rawValue) usage: source=\(snap?.source.rawValue ?? "none") \(rows(snap)) \(tokens(snap)) \(cost(snap)) \(fallback(snap)) \(age(snap)) \(note(snap))")
     }
 }
 

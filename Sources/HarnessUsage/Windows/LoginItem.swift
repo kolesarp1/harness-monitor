@@ -26,7 +26,7 @@ enum LoginItem {
     // Why the login item cannot be registered right now, or nil when it can. Surfaced in Settings: a
     // switch that silently does nothing is worse than one that says why it is off.
     static var unavailableReason: String? {
-        installed(bundlePath: Bundle.main.bundlePath) ? nil : "Move Harness Monitor to /Applications to enable this."
+        installed(bundlePath: Bundle.main.bundlePath) ? nil : "Move Harness Usage to /Applications to enable this."
     }
 
     static var isRegistered: Bool { SMAppService.mainApp.status == .enabled }

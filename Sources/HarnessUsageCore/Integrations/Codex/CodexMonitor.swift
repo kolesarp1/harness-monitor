@@ -1,8 +1,8 @@
 import Foundation
 
-// One Codex profile, in two tiers. The LIVE tier reads Codex's own 5h/weekly meters from the
+// The Codex integration, in two tiers. The LIVE tier reads Codex's own 5h/weekly meters from the
 // ChatGPT backend using the access token the CLI already stores in `auth.json` (read-only, never
-// refreshed — see `CodexAuth`), on the selected global cadence. Underneath sits the passive rollout tier:
+// refreshed — see `CodexAuth`), on its own 300s floor. Underneath sits the passive rollout tier:
 // `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (or `$CODEX_HOME/sessions` — see `codexRoot`), which
 // prefers Codex's own rate limits from the freshest RATE-LIMIT-BEARING rollout and drops an elapsed
 // window when the cached file is read, so a reset meter cannot stay on screen forever. A null-limit
@@ -16,8 +16,10 @@ import Foundation
 // fallback sum.
 public actor CodexMonitor: IntegrationMonitor {
     private let sessionsDir: URL  // `<codexRoot>/sessions`, resolved once at init (honors CODEX_HOME)
-    private let piSessionsDir: URL?  // default account only: pi's openai-codex session logs
-    private let profile: CodexProfile
+    private let codexRoot: URL  // this account's config root — where its `auth.json` lives
+    private let piSessionsDir: URL  // `<home>/.pi/agent/sessions` — harness-driven Codex model usage
+    private let home: URL
+    private let environment: [String: String]
     private let now: @Sendable () -> Date
     private let urlSession: URLSession
     private var lastScan: Date = .distantPast
@@ -34,28 +36,29 @@ public actor CodexMonitor: IntegrationMonitor {
     private var liveMeters: UsageSnapshot?
     private var liveNote: String?
     private var holdUntil: Date = .distantPast  // 429 backoff
-    private var loginIdentity: String?
-    private var hasReadLogin = false
 
     private static let scanInterval: TimeInterval = 2
     private static let scanDays = 7  // cover the weekly window; most date dirs won't exist
+    private static let fetchFloor: TimeInterval = 300
 
+    // `codexRoot` pins this account's config root. nil keeps the pre-accounts behaviour — $CODEX_HOME
+    // when set, else `~/.codex` — which is right for the default account and wrong for any other,
+    // since one CODEX_HOME cannot name two logins.
     public init(
         home: URL,
+        codexRoot: URL? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         environment: [String: String] = ProcessInfo.processInfo.environment,
         urlSession: URLSession? = nil,
-        piSessionsDir: URL? = nil,
-        profile: CodexProfile? = nil,
-        includePiSessions: Bool = true
+        piSessionsDir: URL? = nil
     ) {
-        let profile = profile ?? .standard(home: home, environment: environment)
-        self.profile = profile
-        self.sessionsDir = profile.sessionsDirectory
+        let root = codexRoot ?? Self.codexRoot(home: home, environment: environment)
+        self.codexRoot = root
+        self.sessionsDir = root.appendingPathComponent("sessions", isDirectory: true)
         self.piSessionsDir =
-            includePiSessions
-            ? (piSessionsDir ?? home.appendingPathComponent(".pi/agent/sessions", isDirectory: true))
-            : nil
+            piSessionsDir ?? home.appendingPathComponent(".pi/agent/sessions", isDirectory: true)
+        self.home = home
+        self.environment = environment
         self.now = now
         self.urlSession = urlSession ?? UsageEndpoint.makeSession(requestTimeout: 15)
     }
@@ -64,7 +67,11 @@ public actor CodexMonitor: IntegrationMonitor {
     // else `<home>/.codex`. Read once at init so the scan stays pure/offline. Sessions live under
     // `<root>/sessions/YYYY/MM/DD/`.
     public static func codexRoot(home: URL, environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
-        CodexProfile.defaultDirectory(home: home, environment: environment)
+        if let raw = environment["CODEX_HOME"], let first = raw.split(separator: ",").first {
+            let path = (first.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+            if !path.isEmpty { return URL(fileURLWithPath: path, isDirectory: true) }
+        }
+        return home.appendingPathComponent(".codex", isDirectory: true)
     }
 
     private struct FileInfo {
@@ -77,36 +84,16 @@ public actor CodexMonitor: IntegrationMonitor {
         var estCostUSD: Double?  // approximate cumulative USD for this session (token split × price table)
     }
 
-    public nonisolated var watchPaths: [URL] { [sessionsDir, piSessionsDir].compactMap { $0 } }
+    public nonisolated var watchPaths: [URL] { [sessionsDir, piSessionsDir] }
 
     public func reload(wantUsageEstimate: Bool) async -> UsageSnapshot? {
-        await reload(
-            wantUsageEstimate: wantUsageEstimate, usageInterval: 300,
-            force: false, bypassUsageCadence: false)
-    }
-
-    public func reload(
-        wantUsageEstimate: Bool, usageInterval: TimeInterval, force: Bool,
-        bypassUsageCadence: Bool = false
-    ) async -> UsageSnapshot? {
-        if !force, now().timeIntervalSince(lastScan) < Self.scanInterval, let cached {
+        if now().timeIntervalSince(lastScan) < Self.scanInterval, let cached {
             return cached
         }
-        let token = CodexAuth.read(profile: profile)
-        switchLoginIfNeeded(token)
-        await refreshLiveIfDue(
-            token: token, usageInterval: usageInterval,
-            bypassUsageCadence: bypassUsageCadence)
-        var result = Self.merged(
+        await refreshLiveIfDue()
+        let result = Self.merged(
             rollout: scan(wantUsageEstimate: wantUsageEstimate), live: liveMeters, liveNote: liveNote,
             now: cached?.lastUpdated ?? now())
-        if let claim = token?.usageAccount(profile: profile) {
-            let response = result?.account
-            result?.account = UsageAccount(
-                id: claim.id, email: response?.email ?? claim.email,
-                plan: response?.plan ?? claim.plan, location: profile.location,
-                suggestedName: claim.suggestedName)
-        }
         cached = result
         lastScan = now()
         return result
@@ -117,18 +104,6 @@ public actor CodexMonitor: IntegrationMonitor {
     public func invalidateThrottles() {
         lastScan = .distantPast
         lastFetch = .distantPast
-    }
-
-    public func applyAccountBackoffs(_ holds: [String: Date]) {
-        guard let identity = CodexAuth.read(profile: profile)?.identityId,
-            let hold = holds[identity]
-        else { return }
-        holdUntil = max(holdUntil, hold)
-    }
-
-    public func accountBackoffs() -> [String: Date] {
-        guard let identity = loginIdentity, holdUntil > now() else { return [:] }
-        return [identity: holdUntil]
     }
 
     // The live meters replace the rollout-derived percentages; everything else the rollout knows
@@ -153,7 +128,6 @@ public actor CodexMonitor: IntegrationMonitor {
         guard var merged = rollout else {
             var live = live
             live.note = liveNote
-            if liveNote != nil { live.freshness = .disconnected }
             return live
         }
         let rolloutNote = merged.note
@@ -167,9 +141,7 @@ public actor CodexMonitor: IntegrationMonitor {
         merged.windows = live.windows
         merged.source = .codexUsageAPI
         merged.lastUpdated = live.lastUpdated
-        merged.account = live.account
         merged.note = note(rolloutNote: rolloutNote, liveNote: liveNote, hasWindows: !merged.windows.isEmpty)
-        if liveNote != nil { merged.freshness = .disconnected }
         return merged
     }
 
@@ -182,15 +154,18 @@ public actor CodexMonitor: IntegrationMonitor {
         return liveNote
     }
 
-    // One live attempt, behind the selected cadence and the 429 holdoff. Leaves `liveMeters` untouched on
+    // One live attempt, behind the 300s floor and the 429 holdoff. Leaves `liveMeters` untouched on
     // every failure path so a transient outage keeps the last real reading on screen.
-    private func refreshLiveIfDue(
-        token: CodexAuth.Token?, usageInterval: TimeInterval,
-        bypassUsageCadence: Bool
-    ) async {
-        guard let token else {
+    private func refreshLiveIfDue() async {
+        guard now() >= holdUntil else { return }
+        guard now().timeIntervalSince(lastFetch) >= Self.fetchFloor else { return }
+        lastFetch = now()  // stamped before the call so a failure throttles the retry too
+
+        guard let token = CodexAuth.read(root: codexRoot) else {
+            // Signing out mid-run removes auth.json; keeping the last live meters would show the
+            // signed-out user percentages from an account we can no longer read.
             liveMeters = nil
-            liveNote = "No Codex login found under \(profile.location)"
+            liveNote = "No Codex login found under \(codexRoot.path)"
             return
         }
         guard !token.isExpired(now: now()) else {
@@ -198,46 +173,19 @@ public actor CodexMonitor: IntegrationMonitor {
             liveNote = "Codex login expired — using local session data"
             return
         }
-        guard now() >= holdUntil else { return }
-        guard bypassUsageCadence || now().timeIntervalSince(lastFetch) >= usageInterval else { return }
-        lastFetch = now()  // stamped before the call so a failure throttles the retry too
         switch await CodexUsageClient.fetch(token: token, session: urlSession, now: now()) {
         case .ok(let snapshot):
-            if let responseID = snapshot.account?.id,
-                let expectedID = token.identityId ?? token.accountId,
-                responseID != expectedID
-            {
-                liveMeters = nil
-                liveNote = "Codex account changed while usage was loading"
-            } else {
-                liveMeters = snapshot
-                liveNote = nil
-            }
+            liveMeters = snapshot
+            liveNote = nil
         case .unauthorized:
             liveMeters = nil
             liveNote = "Codex login expired — using local session data"
         case .rateLimited(let retryAfter):
-            holdUntil = retryAfter ?? now().addingTimeInterval(max(300, usageInterval))
+            holdUntil = retryAfter ?? now().addingTimeInterval(Self.fetchFloor)
             liveNote = "Codex is rate-limiting; retrying later"
         case .failed:
             liveNote = "Could not reach the Codex usage endpoint"
         }
-    }
-
-    // A login replacement can leave the old token valid. Drop everything learned from that account
-    // before the new identity is published, and waive our fetch floor so its meter is read now.
-    private func switchLoginIfNeeded(_ token: CodexAuth.Token?) {
-        let current = token?.loginIdentity
-        guard hasReadLogin else {
-            hasReadLogin = true
-            loginIdentity = current
-            return
-        }
-        guard current != loginIdentity else { return }
-        loginIdentity = current
-        liveMeters = nil
-        liveNote = nil
-        lastFetch = .distantPast
     }
 
     // Scans `scanDays` of rollout dirs (today + N days back). Each file is parsed once (cached per
@@ -332,10 +280,7 @@ public actor CodexMonitor: IntegrationMonitor {
 
         // Harness-driven usage: the same account's meters burned through pi (`openai-codex` provider)
         // never touch the rollout logs, so their token counts come from pi's own session logs.
-        let pi =
-            wantUsageEstimate && piSessionsDir != nil
-            ? scanPiSessions(nowDate: nowDate, calendar: cal)
-            : (sums: nil, newestMTime: Date.distantPast)
+        let pi = wantUsageEstimate ? scanPiSessions(nowDate: nowDate, calendar: cal) : (sums: nil, newestMTime: Date.distantPast)
 
         var tIn = sawTodayBreakdown ? todayInput : nil
         var tOut = sawTodayBreakdown ? todayOutput : nil
@@ -402,7 +347,6 @@ public actor CodexMonitor: IntegrationMonitor {
     // rebuilt over the full walk each scan, so deleted files drop out naturally.
     private func scanPiSessions(nowDate: Date, calendar: Calendar) -> (sums: PiDaySums?, newestMTime: Date) {
         let fm = FileManager.default
-        guard let piSessionsDir else { return (nil, .distantPast) }
         guard
             let enumerator = fm.enumerator(
                 at: piSessionsDir, includingPropertiesForKeys: [.contentModificationDateKey],

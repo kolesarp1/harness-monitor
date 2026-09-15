@@ -173,24 +173,6 @@ private func freshDefaults() -> UserDefaults {
     #expect(loaded.providers.isEmpty)  // a dead icon key must not conjure an entry
 }
 
-// Defect: UI cadence persisting a display label or arbitrary seconds that the source floors cannot
-// interpret consistently after relaunch.
-@MainActor
-@Test func updateIntervalRoundTripsOnlySupportedValues() {
-    for interval in UsageUpdateInterval.allCases {
-        let defaults = freshDefaults()
-        let store = SettingsStore(defaults: defaults)
-        var settings = store.settings
-        settings.updateInterval = interval
-        store.update(settings)
-        #expect(SettingsStore(defaults: defaults).settings.updateInterval == interval)
-        #expect(defaults.integer(forKey: "updateIntervalSeconds") == interval.rawValue)
-    }
-    let invalid = freshDefaults()
-    invalid.set(42, forKey: "updateIntervalSeconds")
-    #expect(SettingsStore(defaults: invalid).settings.updateInterval == .fiveMinutes)
-}
-
 // The two notch globals round-trip, including a non-default trigger and a fractional size.
 @MainActor
 @Test func notchSizeAndCardTriggerRoundTrip() {
@@ -224,77 +206,28 @@ private func freshDefaults() -> UserDefaults {
     #expect(SettingsStore(defaults: high).settings.notchScale == Settings.notchScaleRange.upperBound)
 }
 
-// The ring order survives a relaunch, a profile's own ring included, and a hand-edited domain can neither
-// make one ring draw twice nor name a profile with no name.
+// The ring order survives a relaunch, and a hand-edited domain cannot make one harness draw twice.
 @MainActor
-@Test func theRingOrderRoundTripsAndCannotRepeatARing() {
+@Test func theRingOrderRoundTripsAndCannotRepeatAProvider() {
     let d = freshDefaults()
     let store = SettingsStore(defaults: d)
     var s = store.settings
-    let order = [UsageKey(.cursor), UsageKey(.claude, profile: "work"), UsageKey(.claude)]
-    s.providerOrder = order
+    s.providerOrder = [.cursor, .claude]
     store.update(s)
-    #expect(SettingsStore(defaults: d).settings.providerOrder == order)
-    #expect((d.array(forKey: "providerOrder") as? [String]) == ["cursor", "claude:work", "claude"])
+    #expect(SettingsStore(defaults: d).settings.providerOrder == [.cursor, .claude])
 
-    d.set(["cursor", "claude", "cursor", "nonesuch", "claude:"], forKey: "providerOrder")
-    #expect(SettingsStore(defaults: d).settings.providerOrder == [UsageKey(.cursor), UsageKey(.claude)])
+    d.set(["cursor", "claude", "cursor", "nonesuch"], forKey: "providerOrder")
+    #expect(SettingsStore(defaults: d).settings.providerOrder == [.cursor, .claude])
 }
 
 // A dragged order leads; anything it does not name keeps its place behind it, in the order it came.
 @MainActor
 @Test func theNotchOrderPlacesWhatWasDraggedAndAppendsTheRest() {
-    let claude = UsageKey(.claude)
-    let codex = UsageKey(.codex)
-    let cursor = UsageKey(.cursor)
-    let opencode = UsageKey(.opencode)
     var s = Settings.defaults
-    s.providerOrder = [cursor, claude]
-    #expect(s.inNotchOrder([claude, codex, cursor, opencode]) == [cursor, claude, codex, opencode])
-    // A ring that is off or absent is not conjured back into the stack by the stored order.
-    #expect(s.inNotchOrder([codex, claude]) == [claude, codex])
+    s.providerOrder = [.cursor, .claude]
+    #expect(s.inNotchOrder([.claude, .codex, .cursor, .opencode]) == [.cursor, .claude, .codex, .opencode])
+    // A provider that is off or absent is not conjured back into the stack by the stored order.
+    #expect(s.inNotchOrder([.codex, .claude]) == [.claude, .codex])
     // No order stored: the list is handed back exactly as it arrived.
-    #expect(Settings.defaults.inNotchOrder([codex, claude]) == [codex, claude])
-}
-
-// Defect this guards: assigned account names lost on relaunch.
-@MainActor
-@Test func accountNamesRoundTripIncludingAnEmptyStoredValue() {
-    let d = freshDefaults()
-    let store = SettingsStore(defaults: d)
-    var s = store.settings
-    s.accountNames = ["acct-a/org-a": "Work", "acct-b/org-b": ""]
-    store.update(s)
-    #expect(SettingsStore(defaults: d).settings.accountNames == ["acct-a/org-a": "Work", "acct-b/org-b": ""])
-}
-
-// Defect: folder aliases winning over the subscription profile or email prefix, so an account named
-// `alex.k` appears as "Work" merely because it lives under `.codex-work`.
-@Test func automaticAccountNamesPreferTheSubscriptionThenEmailPrefix() {
-    #expect(
-        UsageAccount.automaticName(
-            reportedName: "  alex.k  ", email: "other@example.com", fallback: "work")
-            == "alex.k")
-    #expect(
-        UsageAccount.automaticName(reportedName: nil, email: "alex.k@example.com", fallback: "work")
-            == "alex.k")
-    #expect(UsageAccount.automaticName(reportedName: nil, email: nil, fallback: "work") == "work")
-}
-
-// Defect: a new account remaining unnamed, or a later refresh overwriting a manual rename. Empty
-// persisted names are incomplete assignments and receive the automatic name too.
-@Test func newAccountsReceiveAutomaticNamesWithoutReplacingManualOnes() {
-    func account(_ id: String, _ name: String) -> UsageAccount {
-        UsageAccount(id: id, email: nil, plan: nil, location: "~/.codex", suggestedName: name)
-    }
-    var settings = Settings.defaults
-    settings.accountNames = ["manual": "Personal", "empty": ""]
-
-    let changed = settings.assignAutomaticAccountNames([
-        account("manual", "Ignored"), account("empty", "Recovered"), account("new", "alex.k"),
-    ])
-    #expect(changed)
-    #expect(settings.accountNames == ["manual": "Personal", "empty": "Recovered", "new": "alex.k"])
-    let changedAgain = settings.assignAutomaticAccountNames([account("new", "Changed")])
-    #expect(changedAgain == false)
+    #expect(Settings.defaults.inNotchOrder([.codex, .claude]) == [.codex, .claude])
 }

@@ -11,5 +11,10 @@ struct CursorDescriptor: IntegrationDescriptor {
     var homeRelativePath: String { "Library/Application Support/Cursor" }
     var brandSVG: String { BrandSVG.cursor }
     var brandColor: BrandColor { .adaptive }  // native #000 is invisible on dark glass → adaptive label
-    func makeMonitor(home: URL) -> any IntegrationMonitor { CursorMonitor(home: home) }
+    // Cursor keeps one login per Mac, in a fixed App Support location it does not let a config
+    // directory move. A second Cursor account is therefore a second machine, and `account.configDir`
+    // has nothing to point at — so this reads the one login, whichever account names it.
+    func makeMonitor(home: URL, account: AccountConfig) -> any IntegrationMonitor {
+        CursorMonitor(home: home)
+    }
 }

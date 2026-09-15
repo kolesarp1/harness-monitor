@@ -8,6 +8,7 @@ struct NotchRootView: View {
     let usage: UsageStore
     let settings: SettingsStore
     let selection: ProviderSelection
+    let accounts: [Integration]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Handed to every subview that measures off `Design`, because a global is not one of their
@@ -45,19 +46,22 @@ struct NotchRootView: View {
                 if let provider = model.cardSnapshot, let index = model.cardIndex,
                     model.isExpanded
                 {
-                    NotchUsageCard(usage: usage, settings: settings, selection: selection, scale: scale)
-                        // Identity per showing, not per ring: between rings the card
-                        // is one object that travels, which reads far better than
-                        // one card leaving and another arriving; from hidden it is a
-                        // new object, or a card still fading out would be cancelled
-                        // and slid into place. See `NotchViewModel.cardShowing`.
-                        .id(model.cardShowing)
-                        .position(cardCentre(place, index: index, provider: provider))
-                        .transition(
-                            .opacity.combined(
-                                with: .offset(
-                                    x: model.edge.outward.x * Design.px(24),
-                                    y: model.edge.outward.y * Design.px(24))))
+                    NotchUsageCard(
+                        usage: usage, settings: settings, selection: selection, scale: scale,
+                        accounts: accounts
+                    )
+                    // Identity per showing, not per ring: between rings the card
+                    // is one object that travels, which reads far better than
+                    // one card leaving and another arriving; from hidden it is a
+                    // new object, or a card still fading out would be cancelled
+                    // and slid into place. See `NotchViewModel.cardShowing`.
+                    .id(model.cardShowing)
+                    .position(cardCentre(place, index: index, provider: provider))
+                    .transition(
+                        .opacity.combined(
+                            with: .offset(
+                                x: model.edge.outward.x * Design.px(24),
+                                y: model.edge.outward.y * Design.px(24))))
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height)

@@ -37,7 +37,8 @@ public struct CodexUsageClient: Sendable {
 
         switch http.statusCode {
         case 200:
-            guard let snapshot = snapshot(fromResponseData: data, now: now) else { return .failed }
+            guard var snapshot = snapshot(fromResponseData: data, now: now) else { return .failed }
+            snapshot.accountEmail = token.accountEmail
             return .ok(snapshot)
         // 403 as well as 401: the endpoint uses it for a refused token, and filing it as `.failed`
         // would retry every 300s forever instead of falling back once.
@@ -126,19 +127,9 @@ public struct CodexUsageClient: Sendable {
         let windows = [session, week].compactMap { $0 } + modelWindows
 
         guard !windows.isEmpty else { return nil }
-        let accountID = decoded.accountID?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let email = decoded.email?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let account = accountID.flatMap { id -> UsageAccount? in
-            guard !id.isEmpty else { return nil }
-            return UsageAccount(
-                id: id, email: email?.isEmpty == false ? email : nil,
-                plan: Integration.codex.planDisplayName(decoded.planType), location: "",
-                suggestedName: UsageAccount.automaticName(
-                    reportedName: nil, email: email, fallback: "Codex"))
-        }
         return UsageSnapshot(
             windows: windows, localTokensToday: nil, localTokensWeek: nil,
-            source: .codexUsageAPI, lastUpdated: now, account: account)
+            source: .codexUsageAPI, lastUpdated: now)
     }
 
     // `limit_window_seconds >= 86_400` marks the weekly window; without the field, positional:
@@ -161,7 +152,7 @@ public struct CodexUsageClient: Sendable {
     }
 
     // One window: clamp to 0...100 and read the epoch-seconds reset. A window whose reset already
-    // passed is dropped — that reading describes a period that has ended.
+    // passed is dropped — that reading describes a period that has ended (the donor's shared rule).
     private static func window(
         _ snapshot: WindowSnapshot, id: String, title: String, period: TimeInterval?,
         kind: UsageWindow.Kind, now: Date
@@ -173,24 +164,15 @@ public struct CodexUsageClient: Sendable {
     }
 
     private struct Response: Decodable {
-        let accountID: String?
-        let email: String?
-        let planType: String?
         let rateLimit: RateLimit?
         let additionalRateLimits: [AdditionalLimit]?
         enum CodingKeys: String, CodingKey {
-            case accountID = "account_id"
-            case email
-            case planType = "plan_type"
             case rateLimit = "rate_limit"
             case additionalRateLimits = "additional_rate_limits"
         }
 
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            accountID = try? container.decode(String.self, forKey: .accountID)
-            email = try? container.decode(String.self, forKey: .email)
-            planType = try? container.decode(String.self, forKey: .planType)
             rateLimit = try? container.decode(RateLimit.self, forKey: .rateLimit)
             // Decoded per element through `Lossy`, which never throws: one malformed entry must not
             // discard its valid siblings — nor, since this whole decode is a `try?`, the account's own

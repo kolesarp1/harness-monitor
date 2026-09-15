@@ -26,48 +26,6 @@ private final class CodexUsageStub: URLProtocol {
     }
 }
 
-private final class RequestCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    func increment() { lock.withLock { value += 1 } }
-    func reset() { lock.withLock { value = 0 } }
-    var count: Int { lock.withLock { value } }
-}
-
-private final class CountingCodexUsageStub: URLProtocol {
-    static let counter = RequestCounter()
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func stopLoading() {}
-    override func startLoading() {
-        Self.counter.increment()
-        guard let url = request.url,
-            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)
-        else { return }
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: CodexUsageStub.body)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-}
-
-private final class CodexAccountUsageStub: URLProtocol {
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func stopLoading() {}
-    override func startLoading() {
-        guard let url = request.url,
-            let response = HTTPURLResponse(
-                url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)
-        else { return }
-        let utilization = request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == "acct-b" ? 82 : 14
-        let body = Data(
-            #"{"rate_limit":{"primary_window":{"used_percent":\#(utilization),"reset_at":1755610800,"limit_window_seconds":10800}}}"#.utf8)
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: body)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-}
-
 private final class Clock: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Date
@@ -135,41 +93,6 @@ private func jwt(expiring at: Date) -> String {
     try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: file.path)
     let second = try #require(await monitor.scan())
     #expect(window(second, id: "5h")?.utilization == 60)
-}
-
-// Defect: detected Codex usage retaining a fixed five-minute endpoint floor after the global
-// cadence changes, or manual update failing to bypass that app floor.
-@Test func codexUsageUsesSelectedCadenceAndManualBypass() async throws {
-    let home = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("codex-cadence-\(UUID().uuidString)")
-    let codex = home.appendingPathComponent(".codex")
-    try FileManager.default.createDirectory(at: codex, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: home) }
-    let clock = Clock(Date(timeIntervalSince1970: 1_755_600_000))
-    let token = jwt(expiring: clock.now.addingTimeInterval(86_400))
-    try Data("{\"tokens\":{\"access_token\":\"\(token)\",\"account_id\":\"acct-1\"}}".utf8)
-        .write(to: codex.appendingPathComponent("auth.json"))
-    CountingCodexUsageStub.counter.reset()
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.protocolClasses = [CountingCodexUsageStub.self]
-    let monitor = CodexMonitor(
-        home: home, now: { clock.now }, environment: [:],
-        urlSession: URLSession(configuration: configuration), includePiSessions: false)
-
-    _ = await monitor.reload(wantUsageEstimate: false, usageInterval: 60, force: true)
-    #expect(CountingCodexUsageStub.counter.count == 1)
-    clock.advance(59)
-    _ = await monitor.reload(wantUsageEstimate: false, usageInterval: 60, force: true)
-    #expect(CountingCodexUsageStub.counter.count == 1)
-    clock.advance(1)
-    _ = await monitor.reload(wantUsageEstimate: false, usageInterval: 60, force: true)
-    #expect(CountingCodexUsageStub.counter.count == 2)
-    clock.advance(1)
-    _ = await monitor.reload(wantUsageEstimate: false, usageInterval: 900, force: true)
-    #expect(CountingCodexUsageStub.counter.count == 2)
-    _ = await monitor.reload(
-        wantUsageEstimate: false, usageInterval: 900, force: true,
-        bypassUsageCadence: true)
-    #expect(CountingCodexUsageStub.counter.count == 3)
 }
 
 @Test func liveMetersReplaceRolloutWindowsWholesale() throws {
@@ -360,34 +283,6 @@ private func jwt(expiring at: Date) -> String {
     let signedOut = try #require(await monitor.reload(wantUsageEstimate: false))
     #expect(signedOut.note == "No Codex login found under ~/.codex")
     #expect(signedOut.windows.isEmpty)
-}
-
-// Defect: replacing the login inside one CODEX_HOME while the old token remains valid labels that
-// account with the previous account's retained meters until the 300-second floor ends.
-@Test func switchingAccountsDropsTheOldMeterAndFetchesTheNewLoginNow() async throws {
-    let start = Date(timeIntervalSince1970: 1_755_600_000)
-    let clock = Clock(start)
-    let home = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("codex-switch-\(UUID().uuidString)")
-    let codexDir = home.appendingPathComponent(".codex")
-    try FileManager.default.createDirectory(at: codexDir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: home) }
-
-    let authURL = codexDir.appendingPathComponent("auth.json")
-    let token = jwt(expiring: start.addingTimeInterval(86_400))
-    try Data("{\"tokens\":{\"access_token\":\"\(token)\",\"account_id\":\"acct-a\"}}".utf8).write(to: authURL)
-    let config = URLSessionConfiguration.ephemeral
-    config.protocolClasses = [CodexAccountUsageStub.self]
-    let monitor = CodexMonitor(
-        home: home, now: { clock.now }, environment: [:], urlSession: URLSession(configuration: config))
-
-    #expect(await monitor.reload(wantUsageEstimate: false)?.windows.first?.utilization == 14)
-
-    try Data("{\"tokens\":{\"access_token\":\"\(token)\",\"account_id\":\"acct-b\"}}".utf8).write(to: authURL)
-    clock.advance(3)  // past the scan floor, still inside the live fetch floor
-    let switched = try #require(await monitor.reload(wantUsageEstimate: false))
-
-    #expect(switched.windows.first?.utilization == 82)
-    #expect(switched.account?.id == "acct-b")
 }
 
 // Defect: Codex usage driven through the pi harness (`openai-codex` provider) never writes rollout

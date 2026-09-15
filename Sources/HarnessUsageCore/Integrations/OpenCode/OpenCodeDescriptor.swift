@@ -8,5 +8,9 @@ struct OpenCodeDescriptor: IntegrationDescriptor {
     var homeRelativePath: String { ".local/share/opencode" }
     var brandSVG: String { BrandSVG.opencode }
     var brandColor: BrandColor { .adaptive }
-    func makeMonitor(home: URL) -> any IntegrationMonitor { OpenCodeMonitor(home: home) }
+    // opencode's usage is read straight out of its SQLite db and involves no login at all, so there
+    // is no per-account credential to point a second entry at.
+    func makeMonitor(home: URL, account: AccountConfig) -> any IntegrationMonitor {
+        OpenCodeMonitor(home: home)
+    }
 }

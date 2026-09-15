@@ -1,24 +1,60 @@
+import CryptoKit
 import Foundation
 
 // Resolves Claude Code's OAuth access token, READ-ONLY. Nothing here writes or deletes a credential:
 // there is no refresh path and no file write. An expired or rejected token falls through to the next
 // usage tier and the real `claude` CLI refreshes it on its own schedule.
 //
-// Three sources, first non-empty wins: the CLAUDE_CODE_OAUTH_TOKEN environment variable (default profile
-// only), the profile's credentials file, then the macOS Keychain. On macOS the file usually does NOT
-// exist — Claude Code stores the blob in the Keychain item `Claude Code-credentials`, suffixed per config
-// folder (see `ClaudeProfile`) — so the Keychain branch is the one that normally runs, and it is the
-// branch that can raise a system prompt. The caller gates it.
+// Three sources, first non-empty wins: the CLAUDE_CODE_OAUTH_TOKEN environment variable, the
+// credentials file, then the macOS Keychain. On macOS the file usually does NOT exist — Claude Code
+// stores the blob in the Keychain — so the Keychain branch is the one that normally runs, and it is
+// the branch that can raise a system prompt. The caller gates it.
+//
+// Each config directory has its OWN credential, which is what lets one Mac hold several Claude
+// accounts at once: `~/.claude` and `CLAUDE_CONFIG_DIR=~/.claude-work` are separate logins with
+// separate Keychain items. `keychainService(for:)` reproduces the CLI's own naming for those.
 public enum ClaudeCredentials {
     public static let keychainService = "Claude Code-credentials"
+
+    // Claude Code names the Keychain item for a non-default config directory by appending the first
+    // 8 hex digits of the SHA-256 of the directory PATH, NFC-normalized:
+    //
+    //     `Claude Code-credentials`             the default ~/.claude
+    //     `Claude Code-credentials-a1b2c3d4`    any CLAUDE_CONFIG_DIR
+    //
+    // It hashes the env var's value as the user set it, so a trailing slash or a relative spelling
+    // hashes differently. `candidateServices` tries the plausible spellings rather than one.
+    public static func keychainService(forConfigDir path: String) -> String {
+        let normalized = path.precomposedStringWithCanonicalMapping
+        let digest = SHA256.hash(data: Data(normalized.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined().prefix(8)
+        return "\(keychainService)-\(hex)"
+    }
+
+    /// The Keychain services that could hold this config directory's credential, best first.
+    ///
+    /// `configDir` nil, or the default `~/.claude`, is the unsuffixed item — the CLI only suffixes
+    /// when CLAUDE_CONFIG_DIR is actually set. For anything else we cannot know the exact string the
+    /// user exported, so both the bare path and its trailing-slash spelling are tried; a miss costs
+    /// one `security` call that returns "absent".
+    public static func candidateServices(configDir: URL?, home: URL) -> [String] {
+        guard let configDir else { return [keychainService] }
+        let path = configDir.standardizedFileURL.path
+        if path == home.appendingPathComponent(".claude").standardizedFileURL.path {
+            return [keychainService]
+        }
+        return [keychainService(forConfigDir: path), keychainService(forConfigDir: path + "/")]
+    }
 
     public struct Token: Sendable, Equatable {
         public let accessToken: String
         public let expiresAt: Date?
+        public let accountEmail: String?
 
-        public init(accessToken: String, expiresAt: Date?) {
+        public init(accessToken: String, expiresAt: Date?, accountEmail: String? = nil) {
             self.accessToken = accessToken
             self.expiresAt = expiresAt
+            self.accountEmail = accountEmail
         }
     }
 
@@ -38,6 +74,7 @@ public enum ClaudeCredentials {
     private struct OAuth: Decodable {
         let accessToken: String?
         let expiresAt: Double?  // milliseconds since epoch, not seconds
+        let email: String?
     }
 
     // The blob both the file and the Keychain item hold: `{"claudeAiOauth": {...}}`. `expiresAt` is
@@ -46,118 +83,56 @@ public enum ClaudeCredentials {
         guard let oauth = try? JSONDecoder().decode(Root.self, from: data).claudeAiOauth,
             let access = oauth.accessToken, !access.isEmpty
         else { return nil }
-        return Token(accessToken: access, expiresAt: oauth.expiresAt.map { Date(timeIntervalSince1970: $0 / 1000) })
+        return Token(
+            accessToken: access, expiresAt: oauth.expiresAt.map { Date(timeIntervalSince1970: $0 / 1000) },
+            accountEmail: oauth.email ?? AccountIdentity.email(fromJWT: access))
     }
 
-    private struct State: Decodable { let oauthAccount: StateAccount? }
-    private struct StateAccount: Decodable {
-        let accountUuid: String?
-        let organizationUuid: String?
-        let displayName: String?
-        let fullName: String?
-        let emailAddress: String?
-        let organizationType: String?
-        let organizationRateLimitTier: String?
-    }
-
-    public struct Account: Sendable, Equatable {
-        /// Account and org together: plans are org-scoped, so one person's personal and team logins are
-        /// two accounts.
-        public let id: String
-        public let name: String?
-        public let email: String?
-        public let plan: String?
-        public let identityComplete: Bool
-    }
-
-    // Who is signed in to a profile, from its state file. Claude Code rewrites `oauthAccount` on every
-    // login, so a change here is an account switch even while the previous account's token is still
-    // accepted. nil when logged out or unreadable.
-    public static func account(stateFile: URL) -> Account? {
-        guard let data = FileManager.default.contents(atPath: stateFile.path),
-            let account = try? JSONDecoder().decode(State.self, from: data).oauthAccount,
-            let uuid = account.accountUuid, !uuid.isEmpty
-        else { return nil }
-        let name = nonEmpty(account.displayName) ?? nonEmpty(account.fullName)
-        let email = account.emailAddress.flatMap { $0.isEmpty ? nil : $0 }
-        let organizationID = account.organizationUuid.flatMap(nonEmpty)
-        return Account(
-            id: [uuid, organizationID].compactMap { $0 }.joined(separator: "/"), name: name,
-            email: email,
-            plan: planLabel(tier: account.organizationRateLimitTier, organizationType: account.organizationType),
-            identityComplete: organizationID != nil)
-    }
-
-    private static func nonEmpty(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    // The rate tier is more specific (`default_claude_max_5x`), while organization type covers
-    // plans whose tier does not carry a multiplier. Unknown values remain visible.
-    static func planLabel(tier: String?, organizationType: String?) -> String? {
-        planDisplayName(tier) ?? planDisplayName(organizationType)
-    }
-
-    static func planDisplayName(_ raw: String?) -> String? {
-        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
-        }
-        let normalized = value.lowercased()
-        if normalized.hasSuffix("max_20x") { return "Max 20x" }
-        if normalized.hasSuffix("max_5x") { return "Max 5x" }
-        switch normalized {
-        case "max", "claude_max", "default_claude_max": return "Max"
-        case "pro", "claude_pro", "default_claude_pro": return "Pro"
-        case "team", "claude_team", "default_claude_team", "default_claude_team_5x": return "Team"
-        case "enterprise", "claude_enterprise", "default_claude_enterprise": return "Enterprise"
-        default: return fallbackPlanDisplayName(value)
-        }
-    }
-
+    // `configDir` is the account's Claude config directory; nil means this Mac's default `~/.claude`.
+    //
+    // CLAUDE_CODE_OAUTH_TOKEN is honoured for the DEFAULT account only. It is a single global
+    // override with no notion of which login it belongs to, so letting it answer for every account
+    // would give three rings one account's meters and quietly call them different.
     public static func resolve(
         home: URL,
+        configDir: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment,
         runSecurity: (@Sendable (String) async -> KeychainRead)? = nil
     ) async -> Resolution {
-        await resolve(profile: .standard(home: home), env: env, runSecurity: runSecurity)
-    }
-
-    public static func resolve(
-        profile: ClaudeProfile,
-        env: [String: String] = ProcessInfo.processInfo.environment,
-        runSecurity: (@Sendable (String) async -> KeychainRead)? = nil
-    ) async -> Resolution {
-        // The variable is how a CI box or a shell hands one token over; it has no folder, so it can only
-        // speak for the default login.
-        if profile.name == nil, let raw = env["CLAUDE_CODE_OAUTH_TOKEN"] {
+        if configDir == nil, let raw = env["CLAUDE_CODE_OAUTH_TOKEN"] {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return .found(Token(accessToken: trimmed, expiresAt: nil)) }
         }
-        if let data = FileManager.default.contents(atPath: profile.credentialsFile.path), let token = parse(data) {
+        let dir = configDir ?? home.appendingPathComponent(".claude")
+        let file = dir.appendingPathComponent(".credentials.json")
+        if let data = FileManager.default.contents(atPath: file.path), let token = parse(data) {
             return .found(token)
         }
         guard let runSecurity else { return .absent }
-        // A missing spelling is answered without a dialog, so trying the next one costs one spawn. A failed
-        // read is remembered rather than returned at once: a later spelling may still hold the token.
-        var failure: String?
-        for service in profile.keychainServices {
+
+        // Each candidate spelling in turn. Only a definite answer stops the walk: an `absent` is just
+        // "not under that name", and the next spelling may still hold the item. A failure is reported
+        // rather than swallowed, since that is the branch a denied Keychain prompt lands in.
+        var firstFailure: String?
+        for service in candidateServices(configDir: configDir, home: home) {
             switch await runSecurity(service) {
             case .found(let data):
-                guard let token = parse(data) else { return .unavailable("Claude Keychain credentials are unreadable") }
+                guard let token = parse(data) else {
+                    return .unavailable("Claude Keychain credentials are unreadable")
+                }
                 return .found(token)
             case .absent:
                 continue
             case .failed(let reason):
-                failure = failure ?? reason
+                firstFailure = firstFailure ?? reason
             }
         }
-        return failure.map(Resolution.unavailable) ?? .absent
+        if let firstFailure { return .unavailable(firstFailure) }
+        return .absent
     }
 
     // The default Keychain reader: `/usr/bin/security` as a subprocess rather than SecItemCopyMatching.
-    // The CLI holds a stable, user-grantable ACL entry on the item that survives Harness Monitor being
+    // The CLI holds a stable, user-grantable ACL entry on the item that survives Harness Usage being
     // re-signed, where an in-process read re-prompts on every signature change. Capped so a dialog the
     // user leaves open cannot pin the caller: the process is terminated at the deadline.
     public static func securityCLIReader(timeout: Duration = .milliseconds(1500))

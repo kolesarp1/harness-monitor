@@ -1,11 +1,11 @@
-# Harness Monitor — dev entry points. `make <target>` from the project root.
+# Harness Usage — dev entry points. `make <target>` from the project root.
 # build.sh stays as the full release pipeline; this is the thin ergonomic layer.
 # Signing / notary / version config lives in .env (copy .env.example → .env); build.sh sources it.
 
 .PHONY: build dev mock test lint app release install uninstall clean clean-dev env
 
 LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-APP = /Applications/Harness Monitor.app
+APP = /Applications/Harness Usage.app
 
 # Compile only.
 build:
@@ -43,18 +43,18 @@ release: app
 #
 # Relaunch by path, never `open -a`: the name also matches the freshly registered build/ copy, and
 # LaunchServices may pick that one, leaving the wrong binary running. That copy is also why two
-# "Harness Monitor" entries can show up in Spotlight and the Applications list, so it is unregistered and
+# "Harness Usage" entries can show up in Spotlight and the Applications list, so it is unregistered and
 # deleted here. It has just been installed to /Applications, and the DMG beside it was already built
 # from it.
 install: app
 	@echo "==> installing (quits the running app; cached usage is untouched)"
 	pkill -x HarnessUsage || true
 	rm -rf "$(APP)"
-	ditto "build/Harness Monitor.app" "$(APP)"
+	ditto "build/Harness Usage.app" "$(APP)"
 	codesign --verify --deep --strict "$(APP)"
 	@echo "==> dropping the build copy so only /Applications is listed"
-	@$(LSREGISTER) -u "$(CURDIR)/build/Harness Monitor.app" || true
-	rm -rf "build/Harness Monitor.app"
+	@$(LSREGISTER) -u "$(CURDIR)/build/Harness Usage.app" || true
+	rm -rf "build/Harness Usage.app"
 	open "$(APP)"
 
 # Remove the installed app. Leaves ~/.harness-usage and your preferences alone;

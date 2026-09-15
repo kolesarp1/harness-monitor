@@ -224,38 +224,6 @@ struct GhostIconButton: View {
     }
 }
 
-// A text button for a dialog's action row or a settings row. The prominent one takes the light accent
-// fill the selected sidebar tile uses; the plain one sits in a well, like the popup chips.
-struct DialogButton: View {
-    let title: String
-    var isProminent = false
-    let action: () -> Void
-    @State private var hovering = false
-
-    private var fill: Color {
-        if isProminent { return .csAccent }
-        return hovering ? .csControlHover : .csWell
-    }
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(isProminent ? Color.csOnAccent : Color.csTitle)
-                .padding(.vertical, 5)
-                .padding(.horizontal, 12)
-                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(fill))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .strokeBorder(isProminent ? Color.clear : Color.csBorder, lineWidth: 1)
-                }
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .pointerOnHover { hovering = $0 }
-    }
-}
-
 // The 1px divider used between the header and rows/meters and between setting rows.
 struct GlassDivider: View {
     var body: some View { Rectangle().fill(Color.csDivider).frame(height: 1) }
@@ -383,7 +351,7 @@ enum HoverPriority {
 }
 
 extension View {
-    // Pointing-hand cursor on hover that holds even while Harness Monitor is NOT the frontmost app, optionally
+    // Pointing-hand cursor on hover that holds even while Harness Usage is NOT the frontmost app, optionally
     // reporting the hover state (for hover highlights — SwiftUI's `.onHover` is as unreliable as its cursor
     // in a non-activating panel, so highlights must ride the same AppKit tracking).
     func pointerOnHover(priority: Int = HoverPriority.control, onHover: ((Bool) -> Void)? = nil) -> some View {

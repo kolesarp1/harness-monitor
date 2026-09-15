@@ -54,10 +54,10 @@ private final class Harness: @unchecked Sendable {
         }
     }
 
-    func provider(profile: ClaudeProfile? = nil) -> ClaudeUsageProvider {
+    func provider() -> ClaudeUsageProvider {
         ClaudeUsageProvider(
             cacheURL: home.appendingPathComponent(".harness-usage/claude/usage-cache.json"),
-            home: home, configDir: profile == nil ? home.appendingPathComponent(".claude") : nil, profile: profile,
+            home: home, configDir: home.appendingPathComponent(".claude"),
             now: { [self] in now }, runSecurity: runSecurity, fetchUsage: fetchUsage)
     }
 }
@@ -204,58 +204,6 @@ private let farReset = t0.addingTimeInterval(100_000)
     #expect(window(recovered, id: "5h")?.utilization == 33)
 }
 
-// Defect: the cached token outliving a switch to another account. The old token is still accepted, so
-// nothing 401s and the previous account's meters are shown for the whole run.
-@Test func anAccountSwitchDropsTheOldTokenAndItsMeters() async throws {
-    let h = Harness(
-        now: t0, keychainBlob: keychainBlob(token: "tok-a"),
-        outcomes: [.ok(oauthSnapshot(session: 100, week: 90, at: t0, resetsAt: farReset)), .failed])
-    let state = h.home.appendingPathComponent(".claude.json")
-    try Data(#"{"oauthAccount": {"accountUuid": "acct-a", "organizationUuid": "org-a"}}"#.utf8).write(to: state)
-    let provider = h.provider()
-
-    let first = await provider.refresh(force: true, wantEstimate: false)
-    #expect(window(first, id: "5h")?.utilization == 100)
-
-    // `claude login` as another account, inside both the OAuth and the Keychain floors.
-    try Data(#"{"oauthAccount": {"accountUuid": "acct-b", "organizationUuid": "org-b"}}"#.utf8).write(to: state)
-    h.setKeychainBlob(keychainBlob(token: "tok-b"))
-    h.advance(30)
-    let switched = await provider.refresh(force: true, wantEstimate: false)
-
-    #expect(h.securityCalls == 2)
-    #expect(h.fetchTokens == ["tok-a", "tok-b"])
-    // The new account's fetch failed, and the old account's meters must not stand in for it.
-    #expect(switched.windows.isEmpty)
-}
-
-// Defect: a profile reading the default login's token or identity, so the second ring quotes the first
-// account's meters under the second account's name.
-@Test func aProfileReadsItsOwnCredentialsAndNamesItsOwnAccount() async throws {
-    let h = Harness(
-        now: t0, keychainBlob: keychainBlob(token: "tok-default"),
-        outcomes: [.ok(oauthSnapshot(session: 18, week: 34, at: t0, resetsAt: farReset))])
-    let profile = ClaudeProfile.named("work", home: h.home)
-    try FileManager.default.createDirectory(at: profile.directory, withIntermediateDirectories: true)
-    try keychainBlob(token: "tok-work").write(to: profile.credentialsFile)
-    try Data(
-        #"{"oauthAccount": {"accountUuid": "acct-w", "organizationUuid": "org-w", "displayName": "alex.northwind", "emailAddress": "alex@northwind.dev", "organizationType": "claude_team"}}"#
-            .utf8
-    ).write(to: profile.stateFile)
-    try Data(#"{"oauthAccount": {"accountUuid": "acct-p", "emailAddress": "alex@gmail.com"}}"#.utf8)
-        .write(to: h.home.appendingPathComponent(".claude.json"))
-
-    let snapshot = await h.provider(profile: profile).refresh(force: true, wantEstimate: false)
-
-    #expect(h.fetchTokens == ["tok-work"])
-    #expect(h.securityCalls == 0)
-    #expect(
-        snapshot.account
-            == UsageAccount(
-                id: "acct-w/org-w", email: "alex@northwind.dev", plan: "Team", location: "~/.claude-work",
-                suggestedName: "alex.northwind"))
-}
-
 // Defect: latching on a rotation but NOT on a genuinely rejected login — the endpoint would be hit
 // every 300s forever with a token the server has already refused.
 @Test func aRejectedTokenRearmsWhenTheCredentialFileRotates() async throws {
@@ -311,31 +259,6 @@ private let farReset = t0.addingTimeInterval(100_000)
     #expect(second.note == "Claude usage access was refused by the server")
 }
 
-// Defect: detected Claude OAuth retaining a fixed five-minute network floor after the global
-// cadence changes, or manual update failing to bypass only that app-owned floor.
-@Test func claudeOAuthUsesSelectedCadenceAndManualBypass() async throws {
-    let h = Harness(
-        now: t0, keychainBlob: keychainBlob(token: "tok-a"),
-        outcomes: [.ok(oauthSnapshot(session: 20, week: 30, at: t0, resetsAt: farReset))])
-    let provider = h.provider()
-    _ = await provider.refresh(force: true, wantEstimate: false, usageInterval: 60)
-    #expect(h.fetchCalls == 1)
-    h.advance(59)
-    _ = await provider.refresh(force: true, wantEstimate: false, usageInterval: 60)
-    #expect(h.fetchCalls == 1)
-    h.advance(1)
-    _ = await provider.refresh(force: true, wantEstimate: false, usageInterval: 60)
-    #expect(h.fetchCalls == 2)
-
-    h.advance(1)
-    _ = await provider.refresh(force: true, wantEstimate: false, usageInterval: 900)
-    #expect(h.fetchCalls == 2)
-    _ = await provider.refresh(
-        force: true, wantEstimate: false, usageInterval: 900,
-        bypassUsageCadence: true)
-    #expect(h.fetchCalls == 3)
-}
-
 // Defect: "Update now" dropping only the 15s local floor — the OAuth endpoint is what carries the
 // real meters, so a press inside its 300s floor would spin the rings over the same numbers.
 @Test func invalidatingThrottlesFetchesInsideTheOAuthFloor() async throws {
@@ -369,9 +292,7 @@ private let farReset = t0.addingTimeInterval(100_000)
 
     h.advance(120)
     await provider.invalidateThrottles()
-    _ = await provider.refresh(
-        force: false, wantEstimate: false, usageInterval: 60,
-        bypassUsageCadence: true)
+    _ = await provider.refresh(force: false, wantEstimate: false)
     #expect(h.fetchCalls == 1)  // the hold outlives the press
 
     h.advance(500)  // past the server's own hint

@@ -34,7 +34,8 @@ public enum ClaudeOAuthUsage {
 
         switch http.statusCode {
         case 200:
-            guard let snapshot = parse(data, now: now) else { return .failed }
+            guard var snapshot = parse(data, now: now) else { return .failed }
+            snapshot.accountEmail = token.accountEmail
             return .ok(snapshot)
         // 403 is the documented server-side block on third-party use of a consumer OAuth token, and it
         // is permanent for this login — filing it as `.failed` would retry it every 300s forever. Same
@@ -93,6 +94,12 @@ public enum ClaudeOAuthUsage {
                 }
             }
         }
+    }
+
+    /// The remote probe's entry point — the same decoder the local tier uses, so an account read
+    /// over ssh builds its windows through exactly the code that builds a local one's.
+    public static func snapshot(fromResponseData data: Data, now: Date) -> UsageSnapshot? {
+        parse(data, now: now)
     }
 
     // nil when neither window parses. The caller then falls through to the local token estimate.

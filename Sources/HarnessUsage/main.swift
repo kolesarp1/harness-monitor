@@ -19,7 +19,7 @@ app.setActivationPolicy(.accessory)
 // `mainMenu` while one of its windows is key. Without this, ⌘Q in Settings does nothing and the
 // only way out is the notch's right-click menu.
 let appMenu = NSMenu()
-appMenu.addItem(withTitle: "Quit Harness Monitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+appMenu.addItem(withTitle: "Quit Harness Usage", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 let appMenuItem = NSMenuItem()
 appMenuItem.submenu = appMenu
 let mainMenu = NSMenu()

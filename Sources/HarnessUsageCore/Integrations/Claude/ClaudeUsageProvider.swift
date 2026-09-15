@@ -1,6 +1,6 @@
 import Foundation
 
-// Claude's usage comes from two tiers. The OAuth usage endpoint follows the selected global cadence, and the
+// Claude's usage comes from two tiers. The OAuth usage endpoint is polled on a 300s floor, and the
 // local token estimate adds today's token and cost data. The last successful OAuth snapshot is retained
 // while the endpoint is quiet, and the local estimate is the fallback when no OAuth reading is available.
 // Everything is cached so the widget is never blank.
@@ -8,7 +8,6 @@ public actor ClaudeUsageProvider {
     private let cacheURL: URL
     private let home: URL
     private let configDir: URL?
-    private let profile: ClaudeProfile
     private let now: @Sendable () -> Date
     private let minRefresh: TimeInterval
     private let runSecurity: (@Sendable (String) async -> ClaudeCredentials.KeychainRead)?
@@ -29,8 +28,8 @@ public actor ClaudeUsageProvider {
     // Whether the last actual fetch computed the local token estimate. A change (the user toggling
     // "show token estimate") forces the next fetch past the refresh floor so it takes effect at once.
     private var lastFetchedWantEstimate = true
-    // The selected cadence is enforced here as well as in Engine: ClaudeMonitor has watchPaths, so a
-    // caller outside the engine must not bypass policy. Stamped on EVERY
+    // The 300s cadence lives here, not on the monitor: ClaudeMonitor has watchPaths, so any transcript
+    // write marks it due and a monitor-level pollInterval could never gate this call. Stamped on EVERY
     // attempt (success, failure, rate-limit) so a failing endpoint is not retried every tick.
     private var lastOAuthAttempt: Date = .distantPast
     private var oauthHoldUntil: Date = .distantPast  // 429 backoff, held apart from our own floor
@@ -38,16 +37,13 @@ public actor ClaudeUsageProvider {
     private var rejectedToken: ClaudeCredentials.Token?
     private var lastKeychainResolve: Date = .distantPast
     private static let keychainFloor: TimeInterval = 1_800
-    // The last SUCCESSFUL OAuth reading, retained across refreshes. It stays visible between
-    // scheduled endpoint attempts instead of disappearing on intervening local refreshes.
+    // The last SUCCESSFUL OAuth reading, retained across refreshes. It stays visible while the
+    // endpoint is inside its 300s floor instead of disappearing on the intervening local refreshes.
     private var lastOAuthSnapshot: UsageSnapshot?
-    // Nothing about credential resolution latches. Env and file are re-read each due cycle; the Keychain is
+    // Nothing about credential resolution latches. Env and file are re-read every 300s; the Keychain is
     // read on its own 30-minute floor, which is what keeps a Deny from re-prompting — one `security`
     // spawn per half hour, and none at all while a token is cached.
     private var cachedToken: ClaudeCredentials.Token?
-    // The signed-in account the cached token and readings belong to. Logging into another account does
-    // not invalidate the old token, so without this the old account's meters are fetched indefinitely.
-    private var account: ClaudeCredentials.Account?
     // The last real OAuth windows, re-emitted when a fetch yields none. Without this a single failed
     // fetch writes a window-less snapshot over the cache and the meters vanish. The origin travels with
     // them so the carried snapshot reports where its numbers actually came from.
@@ -55,16 +51,14 @@ public actor ClaudeUsageProvider {
     // Set when the OAuth tier is asked for but cannot deliver, so the UI can say why instead of
     // silently showing nothing.
     public private(set) var note: String?
+    private static let oauthFloor: TimeInterval = 300
 
-    // One index per profile: a scan removes every cached transcript it no longer finds under its own
-    // projects folder, so two profiles sharing an index would delete each other's rows on every refresh.
     private func indexPath() -> String {
-        let file = profile.name.map { "usage-index-\($0).sqlite" } ?? "usage-index.sqlite"
-        return cacheURL.deletingLastPathComponent().appendingPathComponent(file).path
+        cacheURL.deletingLastPathComponent().appendingPathComponent("usage-index.sqlite").path
     }
 
     public init(
-        cacheURL: URL, home: URL, configDir: URL?, profile: ClaudeProfile? = nil,
+        cacheURL: URL, home: URL, configDir: URL?,
         now: @escaping @Sendable () -> Date = { Date() }, minRefresh: TimeInterval = 15,
         runSecurity: (@Sendable (String) async -> ClaudeCredentials.KeychainRead)? = nil,
         urlSession: URLSession? = nil,
@@ -78,9 +72,6 @@ public actor ClaudeUsageProvider {
         self.runSecurity = runSecurity
         let session = urlSession ?? UsageEndpoint.makeSession(requestTimeout: 15)
         self.fetchUsage = fetchUsage ?? { token, at in await ClaudeOAuthUsage.fetch(token: token, session: session, now: at) }
-        let profile = profile ?? .standard(home: home)
-        self.profile = profile
-        self.account = ClaudeCredentials.account(stateFile: profile.stateFile)
         let loaded = ClaudeUsageProvider.loadCache(cacheURL)
         self.snapshot = loaded
         if let loaded {
@@ -95,7 +86,7 @@ public actor ClaudeUsageProvider {
         }
     }
 
-    private func claudeDir() -> URL { configDir ?? profile.directory }
+    private func claudeDir() -> URL { configDir ?? home.appendingPathComponent(".claude") }
     private func projectsDir() -> URL { claudeDir().appendingPathComponent("projects") }
     // Floored unless forced; coalesces concurrent callers onto one in-flight fetch. `wantEstimate`
     // (the user's "show token estimate" setting) gates the expensive transcript scan; a change in it
@@ -108,10 +99,7 @@ public actor ClaudeUsageProvider {
     // Claude monitor). It is NOT safe for concurrent callers with differing `wantEstimate` — the
     // coalescing could hand one a stale-mode snapshot; don't add a second caller without keying
     // `inFlight` by mode.
-    public func refresh(
-        force: Bool, wantEstimate: Bool, usageInterval: TimeInterval = 300,
-        bypassUsageCadence: Bool = false
-    ) async -> UsageSnapshot {
+    public func refresh(force: Bool, wantEstimate: Bool) async -> UsageSnapshot {
         let changed = wantEstimate != lastFetchedWantEstimate
         if let cached = snapshot, !changed,
             !UsageMath.shouldFetch(force: force, lastFetch: lastFetch, now: now(), minRefresh: minRefresh)
@@ -119,18 +107,14 @@ public actor ClaudeUsageProvider {
             return cached
         }
         if !changed, let task = inFlight { return await task.value }
-        let task = Task {
-            await self.performFetch(
-                wantEstimate: wantEstimate, forceOAuth: bypassUsageCadence,
-                usageInterval: usageInterval)
-        }
+        let task = Task { await self.performFetch(wantEstimate: wantEstimate) }
         inFlight = task
         let result = await task.value
         inFlight = nil
         return result
     }
 
-    // Both of this provider's own floors: the 15s local one and the selected OAuth cadence. The 403
+    // Both of this provider's own floors: the 15s local one and the OAuth endpoint's 300s. The 403
     // latch and the Keychain's own retry floor stand — one is permanent for the run, the other is what
     // stops a refused credential turning into a password prompt every time this is pressed.
     public func invalidateThrottles() {
@@ -138,25 +122,13 @@ public actor ClaudeUsageProvider {
         lastOAuthAttempt = .distantPast
     }
 
-    public func applyAccountBackoffs(_ holds: [String: Date]) {
-        guard let id = account?.id, let hold = holds[id] else { return }
-        oauthHoldUntil = max(oauthHoldUntil, hold)
-    }
-
-    public func accountBackoff() -> (String, Date)? {
-        guard let id = account?.id, oauthHoldUntil > now() else { return nil }
-        return (id, oauthHoldUntil)
-    }
-
-    private func performFetch(
-        wantEstimate: Bool, forceOAuth: Bool, usageInterval: TimeInterval
-    ) async -> UsageSnapshot {
+    private func performFetch(wantEstimate: Bool) async -> UsageSnapshot {
         lastFetchedWantEstimate = wantEstimate
 
-        // The OAuth endpoint, attempted on every refresh but self-gated to the selected cadence. It updates
+        // The OAuth endpoint, attempted on every refresh but self-gated to a 300s floor. It updates
         // `lastOAuthSnapshot` on success; reading the retained snapshot inside the floor keeps its
         // meters visible while the local refresh continues.
-        await refreshOAuthIfDue(force: forceOAuth, usageInterval: usageInterval)
+        await refreshOAuthIfDue()
         let live = lastOAuthSnapshot
         if let live { lastRealWindows = (live.windows, live.lastUpdated, live.source) }
 
@@ -222,15 +194,13 @@ public actor ClaudeUsageProvider {
             source: last.source, lastUpdated: snapshot?.lastUpdated ?? now())
     }
 
-    // One OAuth attempt, behind the selected cadence and the 401 latch. Updates `lastOAuthSnapshot` on
+    // One OAuth attempt, behind the 300s floor and the 401 latch. Updates `lastOAuthSnapshot` on
     // success and leaves it untouched on every other path, so a transient failure keeps the last real
     // reading on screen with its true (now visibly older) timestamp.
-    private func refreshOAuthIfDue(force: Bool, usageInterval: TimeInterval) async {
-        let current = ClaudeCredentials.account(stateFile: profile.stateFile)
-        if current?.id != account?.id { switchAccount(to: current) } else { account = current }
+    private func refreshOAuthIfDue() async {
         guard !oauthForbidden else { return }
         guard now() >= oauthHoldUntil else { return }
-        guard force || now().timeIntervalSince(lastOAuthAttempt) >= usageInterval else { return }
+        guard now().timeIntervalSince(lastOAuthAttempt) >= Self.oauthFloor else { return }
         lastOAuthAttempt = now()
         guard let token = await resolveToken() else { return }
         switch await fetchUsage(token, now()) {
@@ -252,21 +222,6 @@ public actor ClaudeUsageProvider {
         }
     }
 
-    // Everything learned about the previous account is dropped: its token, its latches, its meters. Both
-    // floors are waived so the new account is read now — one Keychain read per login is what a login
-    // costs anyway. The server's 429 hold stands.
-    private func switchAccount(to current: ClaudeCredentials.Account?) {
-        account = current
-        cachedToken = nil
-        rejectedToken = nil
-        oauthForbidden = false
-        lastOAuthSnapshot = nil
-        lastRealWindows = nil
-        lastOAuthAttempt = .distantPast
-        lastKeychainResolve = .distantPast
-        note = nil
-    }
-
     // Resolve env/file every due cycle after a rejection. A Keychain read is allowed only on its
     // separate floor, so a refused token cannot turn into an ACL prompt every five minutes.
     private func resolveToken(forceKeychain: Bool = false) async -> ClaudeCredentials.Token? {
@@ -277,15 +232,16 @@ public actor ClaudeUsageProvider {
             let canReadKeychain = forceKeychain || now().timeIntervalSince(lastKeychainResolve) >= Self.keychainFloor
             if canReadKeychain {
                 lastKeychainResolve = now()
-                resolution = await ClaudeCredentials.resolve(profile: profile, runSecurity: runSecurity)
+                resolution = await ClaudeCredentials.resolve(
+                    home: home, configDir: configDir, runSecurity: runSecurity)
             } else {
                 keychainDeferred = true
                 resolution = await ClaudeCredentials.resolve(
-                    profile: profile,
+                    home: home, configDir: configDir,
                     runSecurity: { _ in .failed("Claude Keychain lookup deferred until its 30-minute retry floor") })
             }
         } else {
-            resolution = await ClaudeCredentials.resolve(profile: profile)
+            resolution = await ClaudeCredentials.resolve(home: home, configDir: configDir)
         }
         switch resolution {
         case .found(let token):
@@ -316,7 +272,7 @@ public actor ClaudeUsageProvider {
     // SAME token means the login itself is rejected, and only then does the latch engage.
     // The retained snapshot is dropped only where the latch engages: a rotation is a routine event and
     // the reading it produced minutes ago is still the truth about the account, so clearing it up front
-    // would blank the merge's OAuth side for a full cadence over nothing.
+    // would blank the merge's OAuth side for a full 300s over nothing.
     private func handleUnauthorized(previous: ClaudeCredentials.Token, status: Int) async {
         cachedToken = nil
         guard status == 401 else {
@@ -340,25 +296,10 @@ public actor ClaudeUsageProvider {
         note = "Claude login token was rotated; retrying"
     }
 
-    // The identity the card's first line shows. Prefer Claude's account name, then the email prefix;
-    // the config-folder name is only needed when the account metadata exposes neither.
-    private func usageAccount(_ signedIn: ClaudeCredentials.Account) -> UsageAccount {
-        let proposal = UsageAccount.automaticName(
-            reportedName: signedIn.name, email: signedIn.email, fallback: profile.name ?? "Claude")
-        let identity = signedIn.identityComplete ? signedIn.id : "incomplete:\(signedIn.id)@\(profile.location)"
-        return UsageAccount(
-            id: identity, email: signedIn.email, plan: signedIn.plan, location: profile.location,
-            suggestedName: proposal)
-    }
-
     @discardableResult
     private func complete(_ snap: UsageSnapshot, persist: Bool) -> UsageSnapshot {
         var snap = snap
         snap.note = note
-        snap.account = account.map(usageAccount)
-        if note != nil, !snap.windows.isEmpty {
-            snap.freshness = .disconnected
-        }
         if persist { ClaudeUsageProvider.saveCache(snap, to: cacheURL) }
         snapshot = snap
         lastFetch = now()  // stamped on COMPLETION so the refresh floor measures from when work ended

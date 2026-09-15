@@ -7,14 +7,20 @@ import Observation
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored var onUpdate: (() -> Void)?
 
-    public init(defaults: UserDefaults = .standard) {
+    // The account list is what `load`/`persist` sweep and write keys for. A parameter rather than a
+    // global, and defaulted to the ONE-PER-HARNESS set rather than `Accounts.all`, so neither a test
+    // nor a preview silently reads the user's own `accounts.json`. The app passes its real list.
+    @ObservationIgnored private let accounts: [Integration]
+
+    public init(defaults: UserDefaults = .standard, accounts: [Integration] = AccountsFile.defaultKeys) {
         self.defaults = defaults
-        self.settings = SettingsStore.load(from: defaults)
+        self.accounts = accounts
+        self.settings = SettingsStore.load(from: defaults, accounts: accounts)
     }
 
     public func update(_ new: Settings) {
         settings = new
-        SettingsStore.persist(new, to: defaults)
+        SettingsStore.persist(new, to: defaults, accounts: accounts)
         onUpdate?()
     }
 
@@ -25,11 +31,17 @@ import Observation
 
     // Keys earlier shapes of the app left behind — the per-provider refactor's `menuBar.*`, and the
     // menu bar itself (icon style and tint, the number's tint, the Theme and Herdr toggles, the notch
-    // switch). Removed on load rather than migrated: none of them maps onto a current setting.
+    // switch). Removed on load rather than migrated: this is a single-user app, the reset already
+    // happened on the one install, and reading them back would be a migration with nobody to migrate.
     // Removal is idempotent and costs one pass at launch.
+    // Swept over the HARNESSES rather than the accounts: every one of these keys predates accounts,
+    // so they only ever exist under a bare harness name. A key for an account that no longer exists
+    // is left alone on purpose — removing an account from `accounts.json` to try a different config
+    // directory should not throw away how its ring was set up.
     private nonisolated static let legacyKeys: [String] =
-        Integration.allCases.flatMap { i in
-            ["visible", "iconKind", "iconColor", "scope", "numberColor"].map { "menuBar.\(i.rawValue).\($0)" }
+        Harness.allCases.flatMap { harness -> [String] in
+            let i = Integration(harness: harness)
+            return ["visible", "iconKind", "iconColor", "scope", "numberColor"].map { "menuBar.\(i.rawValue).\($0)" }
                 + ["\(i.rawValue)Enabled", "provider.\(i.rawValue).showModelLimits"]
                 + ["iconKind", "iconColor", "numberColor"].map { providerKey(i, $0) }
         } + ["showTokenEstimate", "showModelLimits", "compact", "widget.showUsage", "didFirstRunPrompt"]
@@ -39,7 +51,7 @@ import Observation
         for key in legacyKeys where d.object(forKey: key) != nil { d.removeObject(forKey: key) }
     }
 
-    public nonisolated static func load(from d: UserDefaults) -> Settings {
+    public nonisolated static func load(from d: UserDefaults, accounts: [Integration] = AccountsFile.defaultKeys) -> Settings {
         let def = Settings.defaults
         func bool(_ k: String, _ fb: Bool) -> Bool { d.object(forKey: k) != nil ? d.bool(forKey: k) : fb }
         func dbl(_ k: String, _ fb: Double) -> Double { d.object(forKey: k) != nil ? d.double(forKey: k) : fb }
@@ -56,7 +68,7 @@ import Observation
         // An entry exists only when at least one of its keys is present. Each field falls back
         // INDIVIDUALLY, so one corrupt value can never reset its siblings.
         var providers: [Integration: ProviderConfig] = [:]
-        for i in Integration.allCases {
+        for i in accounts {
             let visibleKey = providerKey(i, "visible")
             let scopeKey = providerKey(i, "scope")
             let extraCapsKey = providerKey(i, "showExtraCaps")
@@ -74,9 +86,9 @@ import Observation
         // Deduped on the way in. The list is only ever written from a drag, but a hand-edited domain
         // could name a provider twice, and a repeat would put two rings on the notch for one harness
         // — two views under one identity, which is not a state SwiftUI has an answer for.
-        var seen = Set<UsageKey>()
+        var seen = Set<Integration>()
         let order = (d.array(forKey: "providerOrder") as? [String] ?? [])
-            .compactMap(UsageKey.init(rawValue:))
+            .compactMap(Integration.init(rawValue:))
             .filter { seen.insert($0).inserted }
 
         return Settings(
@@ -84,27 +96,21 @@ import Observation
             warningAt: clamped("warningAt", def.warningAt, Settings.thresholdRange),
             criticalAt: clamped("criticalAt", def.criticalAt, Settings.thresholdRange),
             cardTrigger: CardTrigger(rawValue: str("cardTrigger")) ?? def.cardTrigger,
-            updateInterval: UsageUpdateInterval(rawValue: d.integer(forKey: "updateIntervalSeconds"))
-                ?? def.updateInterval,
             notchScale: clamped("notchScale", def.notchScale, Settings.notchScaleRange),
             providerOrder: order,
-            providers: providers,
-            // A non-string value is dropped on its own, so one hand-edited entry cannot cost the rest.
-            accountNames: (d.dictionary(forKey: "accountNames") ?? [:]).compactMapValues { $0 as? String })
+            providers: providers)
     }
 
-    public nonisolated static func persist(_ s: Settings, to d: UserDefaults) {
+    public nonisolated static func persist(_ s: Settings, to d: UserDefaults, accounts: [Integration] = AccountsFile.defaultKeys) {
         d.set(s.usageLayout.rawValue, forKey: "usageLayout")
         d.set(s.warningAt, forKey: "warningAt")
         d.set(s.criticalAt, forKey: "criticalAt")
         d.set(s.cardTrigger.rawValue, forKey: "cardTrigger")
-        d.set(s.updateInterval.rawValue, forKey: "updateIntervalSeconds")
         d.set(s.notchScale, forKey: "notchScale")
         d.set(s.providerOrder.map(\.rawValue), forKey: "providerOrder")
-        d.set(s.accountNames, forKey: "accountNames")
         // Sparse write: an absent entry clears every one of its keys, so a round-trip through the
         // store reproduces the dictionary exactly instead of densifying it with defaults.
-        for i in Integration.allCases {
+        for i in accounts {
             if let cfg = s.providers[i] {
                 d.set(cfg.visible, forKey: providerKey(i, "visible"))
                 d.set(cfg.scope.rawValue, forKey: providerKey(i, "scope"))

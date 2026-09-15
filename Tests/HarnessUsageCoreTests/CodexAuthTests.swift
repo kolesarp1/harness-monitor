@@ -47,24 +47,17 @@ private let expected = Date(timeIntervalSince1970: 1_766_000_000)
 
 @Test func parsesTheAuthFileShapeTheCLIWrites() throws {
     let token = jwt(payload: #"{"exp":1766000000}"#)
-    let idToken = jwt(
-        payload:
-            #"{"name":"alex.k","email":"alex@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"prolite","chatgpt_user_id":"user-7","chatgpt_account_id":"workspace-4"}}"#)
     let data = Data(
         """
         {"auth_mode": "chatgpt",
          "OPENAI_API_KEY": null,
-         "tokens": {"id_token": "\(idToken)", "access_token": "\(token)", "refresh_token": "rt.1.secret", "account_id": "acct-42"},
+         "tokens": {"id_token": "x", "access_token": "\(token)", "refresh_token": "rt.1.secret", "account_id": "acct-42"},
          "last_refresh": "2026-08-17T10:00:00Z"}
         """.utf8)
 
     let parsed = try #require(CodexAuth.parse(data))
     #expect(parsed.accessToken == token)
     #expect(parsed.accountId == "acct-42")
-    #expect(parsed.identityId == "acct-42")
-    #expect(parsed.name == "alex.k")
-    #expect(parsed.email == "alex@example.com")
-    #expect(parsed.plan == "Pro Lite")
     #expect(parsed.expiresAt == expected)
     #expect(parsed.isExpired(now: expected.addingTimeInterval(1)))
     #expect(parsed.isExpired(now: expected.addingTimeInterval(-1)) == false)
@@ -74,31 +67,6 @@ private let expected = Date(timeIntervalSince1970: 1_766_000_000)
     #expect(CodexAuth.parse(Data(#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x","tokens":null}"#.utf8)) == nil)
     #expect(CodexAuth.parse(Data(#"{"tokens":{"access_token":""}}"#.utf8)) == nil)
     #expect(CodexAuth.parse(Data("not json".utf8)) == nil)
-}
-
-// Defect: only a few Codex plan variants becoming readable while known workspace plans leak codes.
-@Test(
-    arguments: [
-        ("free", "Free"), ("go", "Go"), ("plus", "Plus"), ("pro", "Pro"),
-        ("prolite", "Pro Lite"), ("team", "Team"),
-        ("self_serve_business_prolite", "Self Serve Business ProLite"),
-        ("self_serve_business_usage_based", "Self Serve Business Usage Based"),
-        ("business", "Business"), ("ent26", "Enterprise"),
-        ("enterprise_cbp_automation", "Enterprise (Automation)"),
-        ("enterprise_cbp_usage_based", "Enterprise CBP Usage Based"),
-        ("enterprise", "Enterprise"), ("hc", "Enterprise"),
-        ("education", "Edu"), ("edu", "Edu"), ("edu_plus", "Edu Plus"),
-        ("edu_pro", "Edu Pro"),
-    ])
-func knownPlanLabelsMatchCodex(_ raw: String, _ expected: String) {
-    #expect(CodexAuth.planLabel(raw) == expected)
-}
-
-@Test func planLabelsHandlePersistedCapitalizationAndUnknownValues() {
-    #expect(Integration.codex.planDisplayName("Prolite") == "Pro Lite")
-    #expect(Integration.codex.planDisplayName("SELF_SERVE_BUSINESS_USAGE_BASED") == "Self Serve Business Usage Based")
-    #expect(CodexAuth.planLabel("future_plan") == "Future_plan")
-    #expect(CodexAuth.planLabel("  ") == nil)
 }
 
 // Defect: a second $CODEX_HOME implementation drifting from `CodexMonitor.codexRoot` — the live tier

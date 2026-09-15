@@ -3,4 +3,3 @@ build/
 .env
 .DS_Store
 *.dSYM
-docs/
