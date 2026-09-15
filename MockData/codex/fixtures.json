@@ -1,0 +1,101 @@
+{
+  "usage": {
+    "windows": [
+      {
+        "id": "5h",
+        "title": "Session",
+        "utilization": 58,
+        "period": 18000,
+        "resetsAt": 5400,
+        "kind": "account"
+      },
+      {
+        "id": "7d",
+        "title": "Weekly",
+        "utilization": 29,
+        "period": 604800,
+        "resetsAt": 259200,
+        "kind": "account"
+      },
+      {
+        "id": "model:Codex Spark:5h",
+        "title": "Codex Spark 5h",
+        "utilization": 18,
+        "period": 18000,
+        "resetsAt": 5400,
+        "kind": "model:Codex Spark"
+      },
+      {
+        "id": "model:Codex Spark:7d",
+        "title": "Codex Spark Weekly",
+        "utilization": 12,
+        "period": 604800,
+        "resetsAt": 259200,
+        "kind": "model:Codex Spark"
+      }
+    ],
+    "localTokensToday": 89000,
+    "localTokensWeek": 320000,
+    "source": "codexLocal",
+    "lastUpdated": 120,
+    "todayInput": 72000,
+    "todayOutput": 17000,
+    "costTodayUSD": 0.84,
+    "estimatedCostUSD": 1.12,
+    "account": {
+      "id": "mock-codex-personal",
+      "email": "alex.k@gmail.com",
+      "plan": "Pro Lite",
+      "location": "~/.codex",
+      "suggestedName": "Alex.k"
+    },
+    "freshness": "fresh",
+    "activeAccountSource": "detected",
+    "accountSources": [
+      { "kind": "detected", "reference": "~/.codex", "isAvailable": true }
+    ]
+  },
+  "profiles": {
+    "work": {
+      "usage": {
+        "windows": [
+          {
+            "id": "5h",
+            "title": "Session",
+            "utilization": 24,
+            "period": 18000,
+            "resetsAt": 10800,
+            "kind": "account"
+          },
+          {
+            "id": "7d",
+            "title": "Weekly",
+            "utilization": 67,
+            "period": 604800,
+            "resetsAt": 345600,
+            "kind": "account"
+          }
+        ],
+        "localTokensToday": 45000,
+        "source": "codexUsageAPI",
+        "lastUpdated": 180,
+        "todayInput": 35000,
+        "todayOutput": 10000,
+        "estimatedCostUSD": 0.58,
+        "account": {
+          "id": "mock-codex-work",
+          "email": "alex@northwind.dev",
+          "plan": "Business",
+          "location": "Harness Monitor",
+          "suggestedName": "Work"
+        },
+        "freshness": "fallback",
+        "activeAccountSource": "detected",
+        "accountSources": [
+          { "kind": "owned", "reference": "Harness Monitor", "isAvailable": false },
+          { "kind": "detected", "reference": "~/.codex-work", "isAvailable": true }
+        ]
+      }
+    }
+  }
+}

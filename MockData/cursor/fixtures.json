@@ -1,0 +1,16 @@
+{
+  "usage": {
+    "windows": [
+      {
+        "id": "cycle",
+        "title": "Monthly",
+        "utilization": 62.4,
+        "period": 2592000,
+        "resetsAt": 1209600,
+        "kind": "account"
+      }
+    ],
+    "source": "cursorDashboard",
+    "lastUpdated": 1800
+  }
+}

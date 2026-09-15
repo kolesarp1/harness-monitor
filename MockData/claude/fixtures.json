@@ -1,0 +1,129 @@
+{
+  "usage": {
+    "windows": [
+      {
+        "id": "5h",
+        "title": "Session",
+        "utilization": 73,
+        "period": 18000,
+        "resetsAt": 3600,
+        "kind": "account"
+      },
+      {
+        "id": "7d",
+        "title": "Weekly",
+        "utilization": 41,
+        "period": 604800,
+        "resetsAt": 172800,
+        "kind": "account"
+      },
+      {
+        "id": "model:Fable",
+        "title": "Fable",
+        "utilization": 28,
+        "resetsAt": 259200,
+        "kind": "model:Fable"
+      }
+    ],
+    "localTokensToday": 245000,
+    "localTokensWeek": 1200000,
+    "source": "claudeOAuth",
+    "lastUpdated": 300,
+    "todayInput": 180000,
+    "todayOutput": 65000,
+    "estimatedCostUSD": 2.44,
+    "account": {
+      "id": "mock-personal/mock-personal-org",
+      "email": "alex.k@gmail.com",
+      "plan": "Max",
+      "location": "Harness Monitor",
+      "suggestedName": "Alex.k"
+    },
+    "freshness": "fresh",
+    "activeAccountSource": "owned",
+    "accountSources": [
+      { "kind": "owned", "reference": "Harness Monitor", "isAvailable": true },
+      { "kind": "detected", "reference": "~/.claude", "isAvailable": true }
+    ]
+  },
+  "profiles": {
+    "work": {
+      "usage": {
+        "windows": [
+          {
+            "id": "5h",
+            "title": "Session",
+            "utilization": 18,
+            "period": 18000,
+            "resetsAt": 13200,
+            "kind": "account"
+          },
+          {
+            "id": "7d",
+            "title": "Weekly",
+            "utilization": 34,
+            "period": 604800,
+            "resetsAt": 439200,
+            "kind": "account"
+          }
+        ],
+        "localTokensToday": 61000,
+        "localTokensWeek": 410000,
+        "source": "claudeOAuth",
+        "lastUpdated": 120,
+        "todayInput": 44000,
+        "todayOutput": 17000,
+        "estimatedCostUSD": 0.61,
+        "account": {
+          "id": "mock-work/mock-work-org",
+          "email": "alex@northwind.dev",
+          "plan": "Team",
+          "location": "~/.claude-work",
+          "suggestedName": "Work"
+        },
+        "freshness": "fresh",
+        "activeAccountSource": "detected",
+        "accountSources": [
+          { "kind": "detected", "reference": "~/.claude-work", "isAvailable": true }
+        ]
+      }
+    },
+    "old": {
+      "usage": {
+        "windows": [
+          {
+            "id": "5h",
+            "title": "Session",
+            "utilization": 82,
+            "period": 18000,
+            "resetsAt": -3600,
+            "kind": "account"
+          },
+          {
+            "id": "7d",
+            "title": "Weekly",
+            "utilization": 47,
+            "period": 604800,
+            "resetsAt": 86400,
+            "kind": "account"
+          }
+        ],
+        "source": "claudeOAuth",
+        "lastUpdated": 10800,
+        "note": "This connection must be reconnected.",
+        "account": {
+          "id": "mock-old/mock-old-org",
+          "email": "alex.old@gmail.com",
+          "plan": "Pro",
+          "location": "Harness Monitor",
+          "suggestedName": "Old"
+        },
+        "freshness": "disconnected",
+        "activeAccountSource": "retained",
+        "accountSources": [
+          { "kind": "owned", "reference": "Harness Monitor", "isAvailable": false }
+        ]
+      }
+    }
+  }
+}

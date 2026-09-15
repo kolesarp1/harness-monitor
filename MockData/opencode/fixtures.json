@@ -1,0 +1,11 @@
+{
+  "usage": {
+    "windows": [],
+    "localTokensToday": 12000,
+    "localTokensWeek": 45000,
+    "source": "opencodeLocal",
+    "lastUpdated": 60,
+    "todayInput": 9000,
+    "todayOutput": 3000
+  }
+}
