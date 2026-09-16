@@ -42,7 +42,7 @@ swift test
 echo "==> universal release build (${VERSION})"
 swift build -c release --arch arm64 --arch x86_64
 
-BIN=".build/apple/Products/Release/${APP_NAME}"
+BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/${APP_NAME}"
 echo "==> verify universal slices"
 lipo -info "$BIN"   # expect: x86_64 arm64
 
