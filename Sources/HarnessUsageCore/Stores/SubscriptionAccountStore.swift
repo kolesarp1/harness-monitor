@@ -2,6 +2,19 @@ import Darwin
 import Foundation
 
 public actor SubscriptionAccountStore {
+    fileprivate struct DetectionGeneration: Sendable, Equatable {
+        let integration: Integration
+        let value: UInt64
+    }
+
+    private struct StoredDetectionGenerations: Codable {
+        var values: [String: UInt64] = [:]
+    }
+
+    private enum DetectionCommitError: Error {
+        case superseded
+    }
+
     private struct PendingLogin: Sendable {
         let integration: Integration
         let verifier: String
@@ -36,6 +49,7 @@ public actor SubscriptionAccountStore {
     private let providers: [Integration: any SubscriptionOAuthProvider]
     private let now: @Sendable () -> Date
     private let beforeLoginPersistence: (@Sendable (UUID) -> Void)?
+    private let beforeDetectionPersistence: (@Sendable (Integration) async -> Void)?
     private let onLoginSuperseded: (@Sendable (Set<UUID>) -> Void)?
     private var records: [UUID: StoredRecord]
     private var pending: [UUID: PendingLogin] = [:]
@@ -60,12 +74,14 @@ public actor SubscriptionAccountStore {
         home: URL, providers: [Integration: any SubscriptionOAuthProvider],
         now: @escaping @Sendable () -> Date = { Date() },
         beforeLoginPersistence: (@Sendable (UUID) -> Void)? = nil,
+        beforeDetectionPersistence: (@Sendable (Integration) async -> Void)? = nil,
         onLoginSuperseded: (@Sendable (Set<UUID>) -> Void)? = nil
     ) {
         self.directory = home.appendingPathComponent(".harness-usage/accounts", isDirectory: true)
         self.providers = providers
         self.now = now
         self.beforeLoginPersistence = beforeLoginPersistence
+        self.beforeDetectionPersistence = beforeDetectionPersistence
         self.onLoginSuperseded = onLoginSuperseded
         do {
             try Self.prepareDirectory(directory)
@@ -208,6 +224,10 @@ public actor SubscriptionAccountStore {
                     suggestedName: UsageAccount.automaticName(
                         reportedName: result.1.name, email: result.1.email,
                         fallback: existing?.account.suggestedName ?? login.integration.displayName))
+                // Any completed account mutation supersedes detected work that began before it.
+                // Persist this marker first so a failed invalidation cannot save a credential while
+                // allowing an older detection pass to reconcile over it.
+                try Self.advanceDetectionGeneration(for: login.integration, directory: directory)
                 var record =
                     existing
                     ?? StoredRecord(
@@ -247,24 +267,38 @@ public actor SubscriptionAccountStore {
     }
 
     public func removeConnection(for integration: Integration, accountID: String) async throws {
-        let changed = try await withLockedRecords { latest -> Bool in
-            guard var record = latest.values.first(where: { $0.integration == integration && $0.account.id == accountID }) else {
-                throw SubscriptionAccountError.accountNotFound
+        let changed: Bool
+        do {
+            changed = try await withLockedRecords { latest -> Bool in
+                guard var record = latest.values.first(where: { $0.integration == integration && $0.account.id == accountID }) else {
+                    throw SubscriptionAccountError.accountNotFound
+                }
+                let hasAvailableDetectedSource = record.detectedSources.contains(where: \.isAvailable)
+                // Detection remains authoritative for an active local-only account. When an owned login
+                // also exists, removal drops only that app-owned credential and leaves the local source.
+                guard record.credential != nil || !hasAvailableDetectedSource else {
+                    throw SubscriptionAccountError.accountNotFound
+                }
+                try Self.advanceDetectionGeneration(for: integration, directory: directory)
+                refreshTasks.removeValue(forKey: record.fileID)?.cancel()
+                if hasAvailableDetectedSource {
+                    record.credential = nil
+                    record.ownedHealthy = false
+                    record.refreshUncertain = false
+                    record.status = nil
+                    try Self.write(record, directory: directory)
+                    latest[record.fileID] = record
+                } else {
+                    let url = Self.fileURL(record.fileID, directory: directory)
+                    if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+                    latest[record.fileID] = nil
+                }
+                return true
             }
-            refreshTasks.removeValue(forKey: record.fileID)?.cancel()
-            if record.detectedSources.isEmpty {
-                let url = Self.fileURL(record.fileID, directory: directory)
-                if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
-                latest[record.fileID] = nil
-            } else {
-                record.credential = nil
-                record.ownedHealthy = false
-                record.refreshUncertain = false
-                record.status = nil
-                try Self.write(record, directory: directory)
-                latest[record.fileID] = record
-            }
-            return true
+        } catch let error as SubscriptionAccountError {
+            throw error
+        } catch {
+            throw SubscriptionAccountError.persistenceFailed
         }
         if changed { updateHandler?(integration) }
     }
@@ -328,6 +362,16 @@ public actor SubscriptionAccountStore {
 
     func resolve(
         integration: Integration, detected: [String?: UsageSnapshot]
+    ) async -> [String?: UsageSnapshot] {
+        guard let generation = await captureDetectionGeneration(for: integration) else {
+            return retainedResolution(integration: integration)
+        }
+        return await resolve(integration: integration, detected: detected, generation: generation)
+    }
+
+    fileprivate func resolve(
+        integration: Integration, detected: [String?: UsageSnapshot],
+        generation: DetectionGeneration
     ) async -> [String?: UsageSnapshot] {
         do { try await synchronizeFromDisk() } catch { markPersistenceFailure(integration) }
         var detectedByIdentity: [String: [(String, UsageSnapshot)]] = [:]
@@ -404,14 +448,17 @@ public actor SubscriptionAccountStore {
         }
 
         let changed = proposed.filter { records[$0.key] != $0.value }
-        if !changed.isEmpty {
-            do {
-                records = try await persistDetectionChanges(changed)
-            } catch {
-                markPersistenceFailure(integration)
-                for key in resolved.keys where resolved[key]?.account != nil {
-                    resolved[key]?.note = SubscriptionAccountError.persistenceFailed.localizedDescription
-                }
+        do {
+            records = try await persistDetectionChanges(changed, generation: generation)
+        } catch DetectionCommitError.superseded {
+            // A removal or login completed after this pass began. Its mutation owns the account
+            // directory now; publishing this old detector result would resurrect or misattribute it.
+            do { try await synchronizeFromDisk() } catch { markPersistenceFailure(integration) }
+            return retainedResolution(integration: integration)
+        } catch {
+            markPersistenceFailure(integration)
+            for key in resolved.keys where resolved[key]?.account != nil {
+                resolved[key]?.note = SubscriptionAccountError.persistenceFailed.localizedDescription
             }
         }
         return resolved
@@ -544,8 +591,63 @@ public actor SubscriptionAccountStore {
         }
     }
 
-    private func persistDetectionChanges(_ changed: [UUID: StoredRecord]) async throws -> [UUID: StoredRecord] {
-        try await withLockedRecords { latest in
+    fileprivate func captureDetectionGeneration(for integration: Integration) async -> DetectionGeneration? {
+        do {
+            let lock = try await AsyncFileLock.acquire(directory: directory)
+            defer { lock.unlock() }
+            return DetectionGeneration(
+                integration: integration,
+                value: try Self.loadDetectionGenerations(directory)[integration.rawValue] ?? 0)
+        } catch {
+            markPersistenceFailure(integration)
+            return nil
+        }
+    }
+
+    fileprivate func disposition(
+        for result: IntegrationReloadResult, integration: Integration
+    ) async -> IntegrationReloadDisposition {
+        guard let token = result.accountValidationToken,
+            token.integration == integration, let generation = token.generation
+        else {
+            // Capture already built a marked retained view. Reuse it rather than immediately making
+            // another lock/read attempt for the same failed reload.
+            return .validationFailed(current: result.readings)
+        }
+        do {
+            let lock = try await AsyncFileLock.acquire(directory: directory)
+            defer { lock.unlock() }
+            let currentGeneration = try Self.loadDetectionGenerations(directory)[integration.rawValue] ?? 0
+            guard currentGeneration != generation else { return .accepted }
+            records = try Self.loadRecords(directory)
+            return .superseded(current: retainedResolution(integration: integration))
+        } catch {
+            return .validationFailed(
+                current: await persistenceFailureResolution(integration: integration))
+        }
+    }
+
+    fileprivate func persistenceFailureResolution(
+        integration: Integration
+    ) async -> [String?: UsageSnapshot] {
+        // Reload account records independently from the broken generation marker whenever possible.
+        // That preserves retained rows without reviving an identity another process already deleted.
+        if let latest = try? await Self.readLocked(directory: directory) { records = latest }
+        markPersistenceFailure(integration)
+        var current = retainedResolution(integration: integration)
+        for key in current.keys where current[key]?.account != nil {
+            current[key]?.note = SubscriptionAccountError.persistenceFailed.localizedDescription
+        }
+        return current
+    }
+
+    private func persistDetectionChanges(
+        _ changed: [UUID: StoredRecord], generation: DetectionGeneration
+    ) async throws -> [UUID: StoredRecord] {
+        if let beforeDetectionPersistence { await beforeDetectionPersistence(generation.integration) }
+        return try await withLockedRecords { latest -> [UUID: StoredRecord] in
+            let currentGeneration = try Self.loadDetectionGenerations(directory)[generation.integration.rawValue] ?? 0
+            guard currentGeneration == generation.value else { throw DetectionCommitError.superseded }
             for (id, proposed) in changed {
                 if var current = latest[id] {
                     current.detectedSources = proposed.detectedSources
@@ -558,8 +660,23 @@ public actor SubscriptionAccountStore {
                     latest[id] = proposed
                 }
             }
+            return latest
         }
-        return records
+    }
+
+    fileprivate func retainedResolution(integration: Integration) -> [String?: UsageSnapshot] {
+        let usageRecords = records.values.filter { $0.integration == integration }.map { record in
+            AccountUsageRecord(
+                integration: integration, account: record.account,
+                canonicalKey: record.canonicalKey, hasOwnedCredential: record.credential != nil,
+                ownedAvailable: record.ownedHealthy,
+                ownedSnapshot: record.ownedHealthy ? record.lastReading : nil,
+                ownedStatus: record.status, detected: [],
+                rememberedDetectedSources: record.detectedSources,
+                lastReading: record.lastReading)
+        }
+        return AccountUsageResolver.resolve(
+            integration: integration, records: usageRecords, unidentifiedDetected: [:])
     }
 
     private func synchronizeFromDisk() async throws {
@@ -656,6 +773,33 @@ public actor SubscriptionAccountStore {
 
     private static func fileURL(_ id: UUID, directory: URL) -> URL {
         directory.appendingPathComponent(id.uuidString.lowercased()).appendingPathExtension("json")
+    }
+
+    private static func detectionGenerationsURL(_ directory: URL) -> URL {
+        directory.appendingPathComponent(".detection-generations")
+    }
+
+    private static func loadDetectionGenerations(_ directory: URL) throws -> [String: UInt64] {
+        let url = detectionGenerationsURL(directory)
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        return try JSONDecoder().decode(
+            StoredDetectionGenerations.self, from: Data(contentsOf: url)
+        ).values
+    }
+
+    private static func advanceDetectionGeneration(
+        for integration: Integration, directory: URL
+    ) throws {
+        var generations = try loadDetectionGenerations(directory)
+        let current = generations[integration.rawValue] ?? 0
+        guard current < UInt64.max else { throw SubscriptionAccountError.persistenceFailed }
+        generations[integration.rawValue] = current + 1
+        let url = detectionGenerationsURL(directory)
+        try JSONEncoder().encode(StoredDetectionGenerations(values: generations))
+            .write(to: url, options: .atomic)
+        guard chmod(url.path, S_IRUSR | S_IWUSR) == 0 else {
+            throw SubscriptionAccountError.persistenceFailed
+        }
     }
 
     private static func validate(
@@ -757,18 +901,50 @@ private struct SubscriptionAccountMonitor: IntegrationMonitor {
     func reloadProfiles(
         wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
     ) async -> [String?: UsageSnapshot] {
+        await accountReload(
+            wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+            policy: policy
+        ).readings
+    }
+
+    func reloadForEngine(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> IntegrationReloadResult {
+        await accountReload(
+            wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+            policy: policy)
+    }
+
+    func disposition(for result: IntegrationReloadResult) async -> IntegrationReloadDisposition {
+        await store.disposition(for: result, integration: integration)
+    }
+
+    private func accountReload(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> IntegrationReloadResult {
         // Carry server backoff in both directions. A detected 429 learned on the prior tick blocks
         // owned before it can request; an owned 429 blocks detected before this tick's local reload.
         await store.applyAccountBackoffs(await detected.accountBackoffs(), integration: integration)
         await store.prepareOwned(integration: integration, policy: policy)
         await detected.applyAccountBackoffs(await store.accountBackoffs(for: integration))
+        guard let generation = await store.captureDetectionGeneration(for: integration) else {
+            return IntegrationReloadResult(
+                readings: await store.persistenceFailureResolution(integration: integration),
+                accountValidationToken: AccountReloadValidationToken(
+                    integration: integration, generation: nil))
+        }
         let readings =
             includeDetected
             ? await detected.reloadProfiles(
                 wantUsageEstimate: wantUsageEstimate, includeDetected: true, policy: policy)
             : [:]
         await store.applyAccountBackoffs(await detected.accountBackoffs(), integration: integration)
-        return await store.resolve(integration: integration, detected: readings)
+        let resolved = await store.resolve(
+            integration: integration, detected: readings, generation: generation)
+        return IntegrationReloadResult(
+            readings: resolved,
+            accountValidationToken: AccountReloadValidationToken(
+                integration: integration, generation: generation.value))
     }
 
     func invalidateThrottles() async {

@@ -218,6 +218,13 @@ private struct GeneralPane: View {
                         options: [("On hover", CardTrigger.hover), ("On click", .click)],
                         selection: settings.bind(\.cardTrigger), accessibilityLabel: "Show card")
                 }
+                GlassDivider()
+                SettingsRow(
+                    "Hide inactive accounts",
+                    subtitle: "Keep disconnected accounts in Settings but hide their notch rings"
+                ) {
+                    SettingsToggle(isOn: settings.bind(\.hideInactiveAccounts))
+                }
             }
             SettingsGroup("Card") {
                 SettingsRow("Layout") {
@@ -505,14 +512,7 @@ struct AccountRow: View {
                         PlanChip(plan: plan)
                     }
                 }
-                if let problem {
-                    Text(problem.text)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(problemColor(problem.tone))
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if !metadata.isEmpty {
-                    MetadataRow(items: metadata.map { Optional($0) }, font: .system(size: 10.5))
-                }
+                details
             }
             Spacer(minLength: 8)
             if canReconnect {
@@ -540,11 +540,47 @@ struct AccountRow: View {
 
     private var metadata: [String] {
         guard let account = snapshot.account else { return [] }
-        return AccountMetadata.settingsItems(account: account, title: title, sources: sources)
+        return AccountMetadata.settingsItems(
+            account: account, title: title, sources: sources,
+            lastReadingAt: isDisconnected ? snapshot.lastUpdated : nil)
     }
 
     private var problem: AccountProblem? { AccountMetadata.problem(snapshot: snapshot) }
     private var isDisconnected: Bool { snapshot.freshness == .disconnected }
+    private var lastReadingContext: String? {
+        guard isDisconnected else { return nil }
+        return "Last reading \(AccountAge.text(since: snapshot.lastUpdated))"
+    }
+
+    private var metadataAccessibilityLabel: String {
+        (Array(metadata.dropLast()) + [lastReadingContext].compactMap { $0 })
+            .joined(separator: ", ")
+    }
+
+    @ViewBuilder private var details: some View {
+        if isDisconnected {
+            if !metadata.isEmpty {
+                MetadataRow(
+                    items: metadata.map { Optional($0) }, font: .system(size: 10.5),
+                    keepLastItemVisible: true
+                )
+                .accessibilityLabel(metadataAccessibilityLabel)
+                .help(lastReadingContext ?? "")
+            }
+            if let problem { problemText(problem) }
+        } else if let problem {
+            problemText(problem)
+        } else if !metadata.isEmpty {
+            MetadataRow(items: metadata.map { Optional($0) }, font: .system(size: 10.5))
+        }
+    }
+
+    private func problemText(_ problem: AccountProblem) -> some View {
+        Text(problem.text)
+            .font(.system(size: 10.5))
+            .foregroundStyle(problemColor(problem.tone))
+            .fixedSize(horizontal: false, vertical: true)
+    }
 
     private func problemColor(_ tone: AccountProblemTone) -> Color {
         switch tone {
@@ -565,8 +601,9 @@ struct AccountRow: View {
             hasOwnedConnection: owned?.hasOwnedConnection == true, ownedStatus: owned?.status)
     }
 
-    /// Removal always deletes only app-owned credentials. Its label says whether a recorded local
-    /// source keeps the account row alive afterward, even when that source is currently unavailable.
+    /// An active local source remains detection-owned and cannot be forgotten. A historical local
+    /// reference does not keep a disconnected row permanent; without an available source, removal
+    /// forgets the account and any app-owned credential together.
     private var removalLabel: String? {
         guard login != nil else { return nil }
         return AccountActionPolicy.removalLabel(

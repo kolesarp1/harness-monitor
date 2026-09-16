@@ -29,12 +29,271 @@ private actor EngineMonitorStub: IntegrationMonitor {
     func invalidateThrottles() { invalidations += 1 }
 }
 
+private actor EngineOneShotGate {
+    private var shouldPause = true
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func pauseAfterResolve() async {
+        guard shouldPause else { return }
+        shouldPause = false
+        started = true
+        for waiter in startedWaiters { waiter.resume() }
+        startedWaiters = []
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor EngineDetectedProfilesMonitor: IntegrationMonitor {
+    let readings: [String?: UsageSnapshot]
+
+    init(readings: [String?: UsageSnapshot]) { self.readings = readings }
+
+    func reload(wantUsageEstimate: Bool) async -> UsageSnapshot? { nil }
+    func reloadProfiles(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> [String?: UsageSnapshot] {
+        includeDetected ? readings : [:]
+    }
+}
+
+private actor PostResolveBlockingMonitor: IntegrationMonitor {
+    let wrapped: any IntegrationMonitor
+    let gate: EngineOneShotGate
+    private(set) var reloads = 0
+
+    init(wrapped: any IntegrationMonitor, gate: EngineOneShotGate) {
+        self.wrapped = wrapped
+        self.gate = gate
+    }
+
+    nonisolated var watchPaths: [URL] { wrapped.watchPaths }
+    nonisolated var pollInterval: TimeInterval? { wrapped.pollInterval }
+
+    func reload(wantUsageEstimate: Bool) async -> UsageSnapshot? {
+        await wrapped.reload(wantUsageEstimate: wantUsageEstimate)
+    }
+
+    func reloadProfiles(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> [String?: UsageSnapshot] {
+        reloads += 1
+        let resolved = await wrapped.reloadProfiles(
+            wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+            policy: policy)
+        await gate.pauseAfterResolve()
+        return resolved
+    }
+
+    func reloadForEngine(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> IntegrationReloadResult {
+        reloads += 1
+        let resolved = await wrapped.reloadForEngine(
+            wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+            policy: policy)
+        await gate.pauseAfterResolve()
+        return resolved
+    }
+
+    func disposition(for result: IntegrationReloadResult) async -> IntegrationReloadDisposition {
+        await wrapped.disposition(for: result)
+    }
+
+    func invalidateThrottles() async { await wrapped.invalidateThrottles() }
+    func applyAccountBackoffs(_ holds: [String: Date]) async {
+        await wrapped.applyAccountBackoffs(holds)
+    }
+    func accountBackoffs() async -> [String: Date] { await wrapped.accountBackoffs() }
+}
+
+private actor CountingIntegrationMonitor: IntegrationMonitor {
+    let wrapped: any IntegrationMonitor
+    private(set) var reloads = 0
+
+    init(wrapped: any IntegrationMonitor) { self.wrapped = wrapped }
+
+    nonisolated var watchPaths: [URL] { wrapped.watchPaths }
+    nonisolated var pollInterval: TimeInterval? { wrapped.pollInterval }
+
+    func reload(wantUsageEstimate: Bool) async -> UsageSnapshot? {
+        await wrapped.reload(wantUsageEstimate: wantUsageEstimate)
+    }
+
+    func reloadProfiles(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> [String?: UsageSnapshot] {
+        reloads += 1
+        return await wrapped.reloadProfiles(
+            wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+            policy: policy)
+    }
+
+    func reloadForEngine(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> IntegrationReloadResult {
+        reloads += 1
+        return await wrapped.reloadForEngine(
+            wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+            policy: policy)
+    }
+
+    func disposition(for result: IntegrationReloadResult) async -> IntegrationReloadDisposition {
+        await wrapped.disposition(for: result)
+    }
+
+    func invalidateThrottles() async { await wrapped.invalidateThrottles() }
+    func applyAccountBackoffs(_ holds: [String: Date]) async {
+        await wrapped.applyAccountBackoffs(holds)
+    }
+    func accountBackoffs() async -> [String: Date] { await wrapped.accountBackoffs() }
+}
+
 private final class EngineClock: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Date
     init(_ value: Date) { self.value = value }
     var now: Date { lock.withLock { value } }
     func advance(_ interval: TimeInterval) { lock.withLock { value += interval } }
+}
+
+private func engineAccountReading(
+    integration: Integration, id: String, location: String? = nil
+) -> UsageSnapshot {
+    UsageSnapshot(
+        windows: [UsageWindow(id: "5h", title: "Session", utilization: 44, kind: .account)],
+        localTokensToday: nil, localTokensWeek: nil,
+        source: integration == .claude ? .claudeOAuth : .codexUsageAPI,
+        lastUpdated: Date(timeIntervalSince1970: 10),
+        account: UsageAccount(
+            id: id, email: "same@example.com", plan: nil,
+            location: location ?? "~/.\(integration.rawValue)", suggestedName: id))
+}
+
+// Defect: a real account monitor resolving a disconnected retained account, then another process
+// removing it before Engine consumes the result, allowing the stale key into UsageStore.
+@MainActor
+@Test(arguments: [Integration.claude, .codex])
+func engineRejectsAccountResultInvalidatedAfterResolve(_ integration: Integration) async throws {
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "hu-engine-account-race-\(integration.rawValue)-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: home) }
+    let suite = "EngineAccountRace-\(integration.rawValue)-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    let accounts = SubscriptionAccountStore(home: home, providers: [:])
+    let removed = engineAccountReading(integration: integration, id: "account-a")
+    let survivor = engineAccountReading(integration: integration, id: "account-b")
+    _ = await accounts.resolve(
+        integration: integration, detected: ["old-folder": removed, nil: survivor])
+    _ = await accounts.resolve(integration: integration, detected: [nil: survivor])
+
+    let detected = EngineDetectedProfilesMonitor(readings: [nil: survivor])
+    let gate = EngineOneShotGate()
+    let wrapped = PostResolveBlockingMonitor(
+        wrapped: accounts.makeMonitor(for: integration, detectedMonitor: detected), gate: gate)
+    let usage = UsageStore()
+    let engine = Engine(
+        monitors: [integration: wrapped], usage: usage,
+        settings: SettingsStore(defaults: defaults), accounts: accounts)
+
+    let tick = Task { await engine.tick() }
+    await gate.waitUntilStarted()
+    let remover = SubscriptionAccountStore(home: home, providers: [:])
+    try await remover.removeConnection(for: integration, accountID: "account-a")
+    await gate.release()
+    await tick.value
+
+    #expect(usage[UsageKey(integration, profile: "account-a")] == nil)
+    #expect(usage[UsageKey(integration, profile: "account-b")] != nil)
+
+    // Rejection does not stamp the stale attempt as current; it arranges a fresh pass immediately.
+    await engine.tick()
+    #expect(await wrapped.reloads == 2)
+    #expect(usage[UsageKey(integration, profile: "account-a")] == nil)
+    #expect(usage[UsageKey(integration, profile: "account-b")] != nil)
+}
+
+// Defect: a persistent generation-file read failure blanking retained rows and requeuing the account
+// monitor immediately forever instead of recording one failed attempt at the normal cadence.
+@MainActor
+@Test(arguments: [Integration.claude, .codex])
+func generationValidationFailureRetainsRowsAndRespectsCadence(
+    _ integration: Integration
+) async throws {
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "hu-engine-generation-failure-\(integration.rawValue)-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: home) }
+    let suite = "EngineGenerationFailure-\(integration.rawValue)-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let clock = EngineClock(Date(timeIntervalSince1970: 1_000))
+
+    let accounts = SubscriptionAccountStore(home: home, providers: [:])
+    let remembered = engineAccountReading(integration: integration, id: "remembered")
+    let deleted = engineAccountReading(integration: integration, id: "deleted")
+    _ = await accounts.resolve(
+        integration: integration, detected: [nil: remembered, "old-folder": deleted])
+    _ = await accounts.resolve(integration: integration, detected: [:])
+    // A second process deletes one identity while this store still has it in memory. Error recovery
+    // must reload account records independently from the corrupt generation marker and not revive it.
+    let remover = SubscriptionAccountStore(home: home, providers: [:])
+    try await remover.removeConnection(for: integration, accountID: "deleted")
+    let generationFile = home.appendingPathComponent(
+        ".harness-usage/accounts/.detection-generations")
+    try Data("not-json".utf8).write(to: generationFile)
+
+    let detected = EngineDetectedProfilesMonitor(readings: [nil: remembered])
+    let accountMonitor = CountingIntegrationMonitor(
+        wrapped: accounts.makeMonitor(for: integration, detectedMonitor: detected))
+    let other: Integration = integration == .claude ? .codex : .claude
+    let otherSnapshot = UsageSnapshot(
+        windows: [], localTokensToday: 7, localTokensWeek: nil,
+        source: other == .claude ? .claudeOAuth : .codexLocal,
+        lastUpdated: clock.now)
+    let usage = UsageStore()
+    let engine = Engine(
+        monitors: [integration: accountMonitor, other: EngineMonitorStub(snapshot: otherSnapshot)],
+        usage: usage, settings: SettingsStore(defaults: defaults), accounts: accounts,
+        now: { clock.now })
+
+    await engine.tick()
+    let key = UsageKey(integration, profile: "remembered")
+    let deletedKey = UsageKey(integration, profile: "deleted")
+    #expect(await accountMonitor.reloads == 1)
+    #expect(usage[key]?.freshness == .disconnected)
+    #expect(usage[deletedKey] == nil)
+    #expect(usage[key]?.note == SubscriptionAccountError.persistenceFailed.localizedDescription)
+    #expect(usage[UsageKey(other)] == otherSnapshot)
+
+    for _ in 0..<3 { await engine.tick() }
+    #expect(await accountMonitor.reloads == 1)
+    #expect(usage[key]?.note == SubscriptionAccountError.persistenceFailed.localizedDescription)
+    #expect(usage[deletedKey] == nil)
+    #expect(usage[UsageKey(other)] == otherSnapshot)
+
+    try FileManager.default.removeItem(at: generationFile)
+    clock.advance(UsageUpdateInterval.fiveMinutes.seconds)
+    await engine.tick()
+    #expect(await accountMonitor.reloads == 2)
+    #expect(usage[key]?.freshness == .fresh)
+    #expect(usage[key]?.note == nil)
+    #expect(usage[deletedKey] == nil)
+    #expect(usage[UsageKey(other)] == otherSnapshot)
 }
 
 // Defect: a dirty file event bypassing the chosen cadence or being dropped before it becomes due.

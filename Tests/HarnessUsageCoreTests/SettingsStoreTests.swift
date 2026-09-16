@@ -191,6 +191,20 @@ private func freshDefaults() -> UserDefaults {
     #expect(SettingsStore(defaults: invalid).settings.updateInterval == .fiveMinutes)
 }
 
+// Inactive-account visibility is global, defaults to showing every remembered account, and persists
+// independently from provider settings.
+@MainActor
+@Test func hideInactiveAccountsRoundTripsAndDefaultsOff() {
+    let d = freshDefaults()
+    let store = SettingsStore(defaults: d)
+    #expect(store.settings.hideInactiveAccounts == false)
+    var s = store.settings
+    s.hideInactiveAccounts = true
+    store.update(s)
+    #expect(SettingsStore(defaults: d).settings.hideInactiveAccounts)
+    #expect((d.object(forKey: "hideInactiveAccounts") as? Bool) == true)
+}
+
 // The two notch globals round-trip, including a non-default trigger and a fractional size.
 @MainActor
 @Test func notchSizeAndCardTriggerRoundTrip() {

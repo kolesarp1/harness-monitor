@@ -2,6 +2,24 @@ import AppKit
 import HarnessUsageCore
 import SwiftUI
 
+// Index state is reconciled by provider identity whenever filtering or account removal changes the
+// stack. A still-in-range number is not enough: after removing an earlier ring it names a successor.
+struct NotchIdentityState: Equatable {
+    let cardIndex: Int?
+    let hoveredIndex: Int?
+
+    static func reconcile(
+        previous: [UsageKey], current: [UsageKey], cardIndex: Int?, hoveredIndex: Int?
+    ) -> NotchIdentityState {
+        func reindex(_ oldIndex: Int?) -> Int? {
+            guard let oldIndex, previous.indices.contains(oldIndex) else { return nil }
+            return current.firstIndex(of: previous[oldIndex])
+        }
+        return NotchIdentityState(
+            cardIndex: reindex(cardIndex), hoveredIndex: reindex(hoveredIndex))
+    }
+}
+
 // Owns the notch panel: where it sits, which regions take the mouse, and when it folds open or shut.
 //
 // The panel is far larger than the notch — it reserves room for the tooltip — so everything outside
@@ -89,15 +107,14 @@ final class NotchWindowController {
         let wanted = model.panelSize(for: providers)
         let wantedRounded = CGSize(width: wanted.width.rounded(.up), height: wanted.height.rounded(.up))
         let resized = panel.map { $0.frame.size != wantedRounded } ?? true
+        let identities = NotchIdentityState.reconcile(
+            previous: model.snapshots.map(\.key), current: providers.map(\.key),
+            cardIndex: model.cardIndex, hoveredIndex: hoveredIndex)
         model.snapshots = providers
+        model.cardIndex = identities.cardIndex
+        hoveredIndex = identities.hoveredIndex
         invalidateGeometry()
-        if hoveredIndex.map({ !providers.indices.contains($0) }) ?? false { hoveredIndex = nil }
-        if model.cardIndex.map({ !providers.indices.contains($0) }) ?? false { model.cardIndex = nil }
-        // A card index that survives the change may now be a different provider — a ring above it
-        // was switched off — and the card must follow the ring, not the index.
-        if let index = model.cardIndex {
-            syncSelection(to: providers[index].key)
-        }
+        if let index = model.cardIndex { syncSelection(to: providers[index].key) }
         guard isShown else { return }
         if resized || panel == nil {
             relocate(providers: providers)

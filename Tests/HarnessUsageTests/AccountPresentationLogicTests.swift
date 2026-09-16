@@ -90,6 +90,14 @@ struct AccountPresentationLogicTests {
         #expect(
             AccountMetadata.settingsItems(account: account, title: "Person", sources: sources)
                 == ["person@example.com", "~/.claude", "~/.claude-work", "both"])
+        let now = Date(timeIntervalSince1970: 10_000)
+        #expect(
+            AccountMetadata.settingsItems(
+                account: account, title: "Person", sources: sources,
+                lastReadingAt: now.addingTimeInterval(-58 * 60), now: now)
+                == [
+                    "person@example.com", "~/.claude", "~/.claude-work", "both", "58m ago",
+                ])
         #expect(
             AccountMetadata.renameItems(account: account, integration: .claude, sources: sources)
                 == ["Max 5x", "~/.claude", "~/.claude-work", "both"])
@@ -135,18 +143,23 @@ struct AccountPresentationLogicTests {
 
         var disconnected = fresh
         disconnected.freshness = .disconnected
+        #expect(AccountMetadata.problem(snapshot: disconnected, now: now) == nil)
+        #expect(AccountMetadata.statusText(snapshot: disconnected, now: now) == "Last reading 1h ago")
+
         disconnected.note = "Could not reach provider"
         #expect(
             AccountMetadata.problem(snapshot: disconnected, now: now)
-                == AccountProblem(
-                    text: "Could not reach provider · Last reading 1h ago", tone: .disconnected))
+                == AccountProblem(text: "Could not reach provider", tone: .disconnected))
 
         disconnected.note = SubscriptionAccountError.reconnectRequired.localizedDescription
         #expect(
             AccountMetadata.problem(snapshot: disconnected, now: now)
                 == AccountProblem(
-                    text: "This connection must be reconnected · Last reading 1h ago",
+                    text: "This connection must be reconnected.",
                     tone: .disconnectedWarning))
+        #expect(
+            AccountMetadata.statusText(snapshot: disconnected, now: now)
+                == "This connection must be reconnected · Last reading 1h ago")
     }
 
     @Test("account action labels describe what removal leaves behind")
@@ -163,13 +176,16 @@ struct AccountPresentationLogicTests {
                 hasOwnedConnection: false, sources: [local]) == nil)
         #expect(
             AccountActionPolicy.removalLabel(
+                hasOwnedConnection: false, sources: [unavailableLocal]) == "Remove account")
+        #expect(
+            AccountActionPolicy.removalLabel(
                 hasOwnedConnection: true, sources: [owned]) == "Remove account")
         #expect(
             AccountActionPolicy.removalLabel(
                 hasOwnedConnection: true, sources: [owned, local]) == "Remove browser login")
         #expect(
             AccountActionPolicy.removalLabel(
-                hasOwnedConnection: true, sources: [owned, unavailableLocal]) == "Remove browser login")
+                hasOwnedConnection: true, sources: [owned, unavailableLocal]) == "Remove account")
 
         let reconnectRequired = SubscriptionAccountError.reconnectRequired.localizedDescription
         #expect(
@@ -182,6 +198,95 @@ struct AccountPresentationLogicTests {
         #expect(
             AccountActionPolicy.canReconnect(
                 hasOwnedConnection: false, ownedStatus: reconnectRequired) == false)
+    }
+
+    @Test("hide inactive filters disconnected rings only and recovery restores identity")
+    func hideInactiveRingFiltering() {
+        let (usage, settings) = environment()
+        let disconnectedKey = UsageKey(.claude, profile: "disconnected")
+        let fallbackKey = UsageKey(.claude, profile: "fallback")
+        let freshKey = UsageKey(.codex, profile: "fresh")
+        usage.readings = [
+            disconnectedKey: presentationSnapshot(
+                accountID: "disconnected", freshness: .disconnected),
+            fallbackKey: presentationSnapshot(accountID: "fallback", freshness: .fallback),
+            freshKey: presentationSnapshot(accountID: "fresh"),
+        ]
+
+        #expect(
+            NotchProvider.all(
+                usage: usage, settings: settings, detected: [],
+                measureCard: { _, _, _ in .zero }
+            ).map(\.key) == [disconnectedKey, fallbackKey, freshKey])
+
+        var hidden = settings.settings
+        hidden.hideInactiveAccounts = true
+        settings.update(hidden)
+        let filtered = NotchProvider.all(
+            usage: usage, settings: settings, detected: [],
+            measureCard: { _, _, _ in .zero })
+        #expect(filtered.map(\.key) == [fallbackKey, freshKey])
+
+        usage.readings[disconnectedKey]?.freshness = .fresh
+        let recovered = NotchProvider.all(
+            usage: usage, settings: settings, detected: [],
+            measureCard: { _, _, _ in .zero })
+        #expect(recovered.map(\.key) == [disconnectedKey, fallbackKey, freshKey])
+    }
+
+    @Test("all hidden accounts do not become a pending detected placeholder")
+    func allHiddenDoesNotCreatePlaceholder() {
+        let (usage, settings) = environment()
+        let key = UsageKey(.claude, profile: "disconnected")
+        usage.readings = [
+            key: presentationSnapshot(accountID: "disconnected", freshness: .disconnected)
+        ]
+        var hidden = settings.settings
+        hidden.hideInactiveAccounts = true
+        settings.update(hidden)
+
+        let rings = NotchProvider.all(
+            usage: usage, settings: settings, detected: [.claude],
+            accountAvailable: [.claude], measureCard: { _, _, _ in .zero })
+        #expect(rings.isEmpty)
+    }
+
+    @Test("pending first reading remains visible while inactive accounts are hidden")
+    func pendingPlaceholderRemainsVisible() {
+        let (usage, settings) = environment()
+        var hidden = settings.settings
+        hidden.hideInactiveAccounts = true
+        settings.update(hidden)
+        let rings = NotchProvider.all(
+            usage: usage, settings: settings, detected: [.claude],
+            measureCard: { _, _, _ in .zero })
+        #expect(rings.map(\.key) == [UsageKey(.claude)])
+    }
+
+    @Test("removing the selected identity dismisses its card and hover", arguments: [0, 1, 2])
+    func removedIdentityDismissesPresentation(_ removedIndex: Int) {
+        let previous = [
+            UsageKey(.claude, profile: "first"),
+            UsageKey(.claude, profile: "middle"),
+            UsageKey(.codex, profile: "last"),
+        ]
+        var current = previous
+        current.remove(at: removedIndex)
+        let reconciled = NotchIdentityState.reconcile(
+            previous: previous, current: current,
+            cardIndex: removedIndex, hoveredIndex: removedIndex)
+        #expect(reconciled == NotchIdentityState(cardIndex: nil, hoveredIndex: nil))
+    }
+
+    @Test("surviving card and hover identities are reindexed after an earlier removal")
+    func survivingIdentitiesAreReindexed() {
+        let first = UsageKey(.claude, profile: "first")
+        let hovered = UsageKey(.claude, profile: "middle")
+        let selected = UsageKey(.codex, profile: "last")
+        let reconciled = NotchIdentityState.reconcile(
+            previous: [first, hovered, selected], current: [hovered, selected],
+            cardIndex: 2, hoveredIndex: 1)
+        #expect(reconciled == NotchIdentityState(cardIndex: 1, hoveredIndex: 0))
     }
 
     @Test("passed-reset stale ring suppresses old percentage")

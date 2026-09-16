@@ -92,12 +92,16 @@ struct AccountProblem: Equatable {
 
 enum AccountMetadata {
     static func settingsItems(
-        account: UsageAccount, title: String, sources: [UsageAccountSource]
+        account: UsageAccount, title: String, sources: [UsageAccountSource],
+        lastReadingAt: Date? = nil, now: Date = Date()
     ) -> [String] {
         MetadataRow.values(
             [title == account.email ? nil : account.email]
                 + detectedPaths(sources).map(Optional.some)
-                + [AccountSourceKind.classify(sources)?.rawValue])
+                + [
+                    AccountSourceKind.classify(sources)?.rawValue,
+                    lastReadingAt.map { AccountAge.text(since: $0, now: now) },
+                ])
     }
 
     static func cardItems(account: UsageAccount, title: String) -> [String] {
@@ -114,7 +118,12 @@ enum AccountMetadata {
     }
 
     static func statusText(snapshot: UsageSnapshot, now: Date = Date()) -> String? {
-        problem(snapshot: snapshot, now: now)?.text
+        guard snapshot.freshness == .disconnected else {
+            return problem(snapshot: snapshot, now: now)?.text
+        }
+        let note = MetadataRow.values([snapshot.note]).first
+        let age = "Last reading \(AccountAge.text(since: snapshot.lastUpdated, now: now))"
+        return note.map { joinedStatus($0, age) } ?? age
     }
 
     static func problem(snapshot: UsageSnapshot, now: Date = Date()) -> AccountProblem? {
@@ -127,13 +136,12 @@ enum AccountMetadata {
             return AccountProblem(
                 text: joinedStatus(reason, "Showing local reading"), tone: .fallback)
         case .disconnected:
-            let age = "Last reading \(AccountAge.text(since: snapshot.lastUpdated, now: now))"
+            guard let note else { return nil }
             let tone: AccountProblemTone =
                 note == SubscriptionAccountError.reconnectRequired.localizedDescription
                 ? .disconnectedWarning
                 : .disconnected
-            return AccountProblem(
-                text: note.map { joinedStatus($0, age) } ?? age, tone: tone)
+            return AccountProblem(text: note, tone: tone)
         }
     }
 
@@ -151,10 +159,11 @@ enum AccountActionPolicy {
     static func removalLabel(
         hasOwnedConnection: Bool, sources: [UsageAccountSource]
     ) -> String? {
-        guard hasOwnedConnection else { return nil }
-        return sources.contains { $0.kind == .detected }
-            ? "Remove browser login"
-            : "Remove account"
+        let hasAvailableLocal = sources.contains { $0.kind == .detected && $0.isAvailable }
+        if hasAvailableLocal { return hasOwnedConnection ? "Remove browser login" : nil }
+        return hasOwnedConnection || sources.contains { $0.kind == .detected }
+            ? "Remove account"
+            : nil
     }
 
     static func canReconnect(hasOwnedConnection: Bool, ownedStatus: String?) -> Bool {
@@ -188,6 +197,7 @@ struct MetadataRow: View {
     let items: [String?]
     var font: Font = .system(size: 11)
     var foreground: Color = .csLabel
+    var keepLastItemVisible = false
 
     nonisolated static func values(_ items: [String?]) -> [String] {
         var seen = Set<String>()
@@ -206,11 +216,13 @@ struct MetadataRow: View {
     }
 
     var body: some View {
+        let parts = Self.parts(items)
         HStack(spacing: 4) {
-            ForEach(Self.parts(items), id: \.self) { part in
+            ForEach(parts, id: \.self) { part in
                 Text(part.text)
                     .foregroundStyle(part.isSeparator ? Color.csFaint : foreground)
                     .accessibilityHidden(part.isSeparator)
+                    .layoutPriority(keepLastItemVisible && part == parts.last ? 1 : 0)
             }
         }
         .font(font)

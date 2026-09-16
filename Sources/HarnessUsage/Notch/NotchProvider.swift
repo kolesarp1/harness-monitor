@@ -58,12 +58,18 @@ struct NotchProvider: Identifiable, Equatable {
                     && s.provider(for: $0).visible
             }
             .flatMap { integration -> [UsageKey] in
-                let readings = usage.keys(for: integration)
+                let publishedReadings = usage.keys(for: integration)
+                let visibleReadings = publishedReadings.filter { key in
+                    !s.hideInactiveAccounts || usage[key]?.freshness != .disconnected
+                }
                 // Detection gets one placeholder only before this provider has published anything.
+                // Hiding every disconnected reading must not turn them into a pending placeholder.
                 // Recognized accounts use canonical identity keys, so adding a default beside them
                 // would create a phantom duplicate ring.
-                if detected.contains(integration), readings.isEmpty { return [UsageKey(integration)] }
-                return readings
+                if detected.contains(integration), publishedReadings.isEmpty {
+                    return [UsageKey(integration)]
+                }
+                return visibleReadings
             }
         return s.inNotchOrder(keys).map {
             build($0, usage: usage, settings: settings, cardSize: measureCard($0, usage, settings))

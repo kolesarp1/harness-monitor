@@ -158,7 +158,7 @@ import Foundation
 
         // Concurrent monitor reload: all due monitors do their IO on their own actors in parallel,
         // so the main actor stays free to handle UI (window dragging, rendering) while waiting.
-        let results = await withTaskGroup(of: (Integration, [String?: UsageSnapshot]).self) { group in
+        let results = await withTaskGroup(of: (Integration, IntegrationReloadResult).self) { group in
             for (integration, monitor) in monitors {
                 guard due.contains(integration) else { continue }
                 group.addTask(priority: .utility) {
@@ -167,7 +167,7 @@ import Foundation
                     guard PerfLog.enabled else {
                         return (
                             integration,
-                            await monitor.reloadProfiles(
+                            await monitor.reloadForEngine(
                                 wantUsageEstimate: want, includeDetected: includeDetected,
                                 policy: UsageReloadPolicy(
                                     interval: s.updateInterval,
@@ -175,7 +175,7 @@ import Foundation
                         )
                     }
                     let t0 = ContinuousClock.now
-                    let r = await monitor.reloadProfiles(
+                    let r = await monitor.reloadForEngine(
                         wantUsageEstimate: want, includeDetected: includeDetected,
                         policy: UsageReloadPolicy(
                             interval: s.updateInterval,
@@ -185,17 +185,37 @@ import Foundation
                     return (integration, r)
                 }
             }
-            var collected: [(Integration, [String?: UsageSnapshot])] = []
+            var collected: [(Integration, IntegrationReloadResult)] = []
             for await item in group {
                 collected.append(item)
             }
             return collected
         }
         let stamp = now()
-        for (integration, readings) in results {
-            lastReload[integration] = stamp
-            lastSnapshots[integration] = readings
+        var supersededAny = false
+        for (integration, result) in results {
+            guard let monitor = monitors[integration] else { continue }
+            switch await monitor.disposition(for: result) {
+            case .accepted:
+                lastReload[integration] = stamp
+                lastSnapshots[integration] = result.readings
+            case .superseded(let current):
+                // Validation is the account result's publication linearization point. A mutation that
+                // advanced the persisted generation before this check owns the provider now, so use
+                // the store's current retained view and schedule fresh work instead of consuming the
+                // stale in-flight result. Mutations after this point land on a later engine signal.
+                lastSnapshots[integration] = current
+                explicitlyDue.insert(integration)
+                supersededAny = true
+            case .validationFailed(let current):
+                // A persistent lock/read failure is an attempted reload, not evidence of newer data.
+                // Keep the marked retained view and its normal cadence; immediately waking here would
+                // bypass cadence forever while the persistence problem remains.
+                lastReload[integration] = stamp
+                lastSnapshots[integration] = current
+            }
         }
+        if supersededAny { wake() }
 
         publish(detected: detected)
     }

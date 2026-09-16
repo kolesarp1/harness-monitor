@@ -119,6 +119,48 @@ private actor EmptyDetectedMonitor: IntegrationMonitor {
     }
 }
 
+private actor OneShotAsyncGate {
+    private var shouldPause = true
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func pauseIfNeeded() async {
+        guard shouldPause else { return }
+        shouldPause = false
+        started = true
+        for waiter in startedWaiters { waiter.resume() }
+        startedWaiters = []
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor BlockingDetectedMonitor: IntegrationMonitor {
+    let reading: UsageSnapshot
+    let gate: OneShotAsyncGate
+
+    init(reading: UsageSnapshot, gate: OneShotAsyncGate) {
+        self.reading = reading
+        self.gate = gate
+    }
+
+    func reload(wantUsageEstimate: Bool) async -> UsageSnapshot? { reading }
+    func reloadProfiles(wantUsageEstimate: Bool) async -> [String?: UsageSnapshot] {
+        await gate.pauseIfNeeded()
+        return [nil: reading]
+    }
+}
+
 private actor BackoffAwareDetectedMonitor: IntegrationMonitor {
     private(set) var networkAttempts = 0
     private var holds: [String: Date] = [:]
@@ -158,6 +200,19 @@ private func disposableHome(_ name: String = "accounts") throws -> URL {
     let home = FileManager.default.temporaryDirectory.appendingPathComponent("hu-\(name)-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
     return home
+}
+
+private func detectedAccountReading(
+    integration: Integration, id: String, location: String? = nil
+) -> UsageSnapshot {
+    UsageSnapshot(
+        windows: [UsageWindow(id: "5h", title: "Session", utilization: 44, kind: .account)],
+        localTokensToday: nil, localTokensWeek: nil,
+        source: integration == .claude ? .claudeOAuth : .codexUsageAPI,
+        lastUpdated: Date(timeIntervalSince1970: 10),
+        account: UsageAccount(
+            id: id, email: "same@example.com", plan: nil,
+            location: location ?? "~/.\(integration.rawValue)", suggestedName: id))
 }
 
 private func callback(for login: SubscriptionLogin) throws -> URL {
@@ -651,6 +706,168 @@ private final class HeldAccountFileLock {
         #expect(switched["old/org"]?.accountSources.first?.isAvailable == false)
         let afterSwitchRestart = SubscriptionAccountStore(home: home, providers: [:])
         #expect(await afterSwitchRestart.accountSnapshots().map(\.account.id).sorted() == ["new/org", "old/org"])
+    }
+
+    // Defect: a local A → B switch leaving A permanently remembered because its historical folder
+    // reference is mistaken for a currently available source.
+    @Test(arguments: [Integration.claude, .codex])
+    func localSwitchLeavesOldAccountRemovable(_ integration: Integration) async throws {
+        let home = try disposableHome("local-switch-\(integration.rawValue)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let store = SubscriptionAccountStore(home: home, providers: [:])
+
+        _ = await store.resolve(
+            integration: integration,
+            detected: [nil: detectedAccountReading(integration: integration, id: "account-a")])
+        let switched = await store.resolve(
+            integration: integration,
+            detected: [nil: detectedAccountReading(integration: integration, id: "account-b")])
+        #expect(switched["account-a"]?.freshness == .disconnected)
+        #expect(switched["account-b"]?.freshness == .fresh)
+
+        try await store.removeConnection(for: integration, accountID: "account-a")
+        #expect(await store.accountSnapshots().map(\.account.id) == ["account-b"])
+        let restarted = SubscriptionAccountStore(home: home, providers: [:])
+        #expect(await restarted.accountSnapshots().map(\.account.id) == ["account-b"])
+
+        let rediscovered = await restarted.resolve(
+            integration: integration,
+            detected: [
+                "old-folder": detectedAccountReading(integration: integration, id: "account-a"),
+                nil: detectedAccountReading(integration: integration, id: "account-b"),
+            ])
+        #expect(rediscovered.keys.compactMap { $0 }.sorted() == ["account-a", "account-b"])
+    }
+
+    // Defect: an owned-only account being left on disk after removal, or the removal marker acting as
+    // a permanent tombstone when that same provider identity is explicitly added again.
+    @Test(arguments: [Integration.claude, .codex])
+    func ownedOnlyAccountCanBeRemovedAndExplicitlyReadded(_ integration: Integration) async throws {
+        let home = try disposableHome("owned-readd-\(integration.rawValue)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let state = SyntheticOAuthState()
+        let provider = SyntheticOAuthProvider(integration: integration, state: state)
+        let store = SubscriptionAccountStore(home: home, providers: [integration: provider])
+
+        let first = try await store.beginLogin(for: integration)
+        _ = try await store.completeLogin(first.id, callbackURL: callback(for: first))
+        #expect(await store.accountSnapshots().map(\.account.id) == ["account-1"])
+        try await store.removeConnection(for: integration, accountID: "account-1")
+        #expect(await store.accountSnapshots().isEmpty)
+        #expect(await SubscriptionAccountStore(home: home, providers: [:]).accountSnapshots().isEmpty)
+
+        let second = try await store.beginLogin(for: integration)
+        _ = try await store.completeLogin(second.id, callbackURL: callback(for: second))
+        #expect(await store.accountSnapshots().map(\.account.id) == ["account-1"])
+        #expect(
+            await SubscriptionAccountStore(home: home, providers: [:])
+                .accountSnapshots().map(\.account.id) == ["account-1"])
+    }
+
+    // Defect: removing an owned login either deleting its still-active local account or retaining an
+    // unavailable local reference forever after that fallback later disappears.
+    @Test(arguments: [Integration.claude, .codex])
+    func ownedAndLocalRemovalFollowsCurrentAvailability(_ integration: Integration) async throws {
+        let home = try disposableHome("owned-local-removal-\(integration.rawValue)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let state = SyntheticOAuthState()
+        let provider = SyntheticOAuthProvider(integration: integration, state: state)
+        let store = SubscriptionAccountStore(home: home, providers: [integration: provider])
+        let login = try await store.beginLogin(for: integration)
+        _ = try await store.completeLogin(login.id, callbackURL: callback(for: login))
+        _ = await store.resolve(
+            integration: integration,
+            detected: [nil: detectedAccountReading(integration: integration, id: "account-1")])
+
+        try await store.removeConnection(for: integration, accountID: "account-1")
+        let localOnly = try #require(await store.accountSnapshots().first)
+        #expect(localOnly.hasOwnedConnection == false)
+        #expect(localOnly.sources.contains { $0.kind == .detected && $0.isAvailable })
+
+        _ = await store.resolve(integration: integration, detected: [:])
+        try await store.removeConnection(for: integration, accountID: "account-1")
+        #expect(await store.accountSnapshots().isEmpty)
+    }
+
+    // Defect: detection-generation persistence failing after the UI asks to remove an account, but
+    // the failure being flattened to a generic login error or the account disappearing anyway.
+    @Test func removalGenerationFailureIsVisibleAndFailsClosed() async throws {
+        let home = try disposableHome("remove-generation-failure")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let store = SubscriptionAccountStore(home: home, providers: [:])
+        let reading = detectedAccountReading(integration: .claude, id: "account-a")
+        _ = await store.resolve(integration: .claude, detected: [nil: reading])
+        _ = await store.resolve(integration: .claude, detected: [:])
+        let generationFile = home.appendingPathComponent(
+            ".harness-usage/accounts/.detection-generations")
+        try Data("not-json".utf8).write(to: generationFile)
+
+        await #expect(throws: SubscriptionAccountError.persistenceFailed) {
+            try await store.removeConnection(for: .claude, accountID: "account-a")
+        }
+        #expect(await store.accountSnapshots().map(\.account.id) == ["account-a"])
+        #expect(
+            await SubscriptionAccountStore(home: home, providers: [:])
+                .accountSnapshots().map(\.account.id) == ["account-a"])
+    }
+
+    // Defect: detected work begun before a removal publishing and persisting the removed account once
+    // its provider reload resumes. The next genuinely current pass may still rediscover it.
+    @Test(arguments: [Integration.claude, .codex])
+    func removalInvalidatesDetectionSuspendedInProviderReload(_ integration: Integration) async throws {
+        let home = try disposableHome("detection-reload-race-\(integration.rawValue)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let store = SubscriptionAccountStore(home: home, providers: [:])
+        let reading = detectedAccountReading(integration: integration, id: "account-a")
+        _ = await store.resolve(integration: integration, detected: [nil: reading])
+        _ = await store.resolve(integration: integration, detected: [:])
+
+        let gate = OneShotAsyncGate()
+        let detected = BlockingDetectedMonitor(reading: reading, gate: gate)
+        let monitor = store.makeMonitor(for: integration, detectedMonitor: detected)
+        let staleReload = Task { await monitor.reloadProfiles(wantUsageEstimate: false) }
+        await gate.waitUntilStarted()
+        try await store.removeConnection(for: integration, accountID: "account-a")
+        await gate.release()
+
+        let staleResult = await staleReload.value
+        #expect(staleResult["account-a"] == nil)
+        #expect(await store.accountSnapshots().isEmpty)
+        #expect(await SubscriptionAccountStore(home: home, providers: [:]).accountSnapshots().isEmpty)
+
+        let rediscovered = await monitor.reloadProfiles(wantUsageEstimate: false)
+        #expect(rediscovered["account-a"]?.freshness == .fresh)
+    }
+
+    // Defect: a second store removing an account while an older detection proposal waits to persist,
+    // then that proposal recreating the deleted file after it finally acquires the directory lock.
+    @Test(arguments: [Integration.claude, .codex])
+    func removalInvalidatesDetectionSuspendedBeforePersistence(_ integration: Integration) async throws {
+        let home = try disposableHome("detection-persistence-race-\(integration.rawValue)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let initial = SubscriptionAccountStore(home: home, providers: [:])
+        let reading = detectedAccountReading(integration: integration, id: "account-a")
+        _ = await initial.resolve(integration: integration, detected: [nil: reading])
+        _ = await initial.resolve(integration: integration, detected: [:])
+
+        let gate = OneShotAsyncGate()
+        let stale = SubscriptionAccountStore(
+            home: home, providers: [:],
+            beforeDetectionPersistence: { _ in await gate.pauseIfNeeded() })
+        let remover = SubscriptionAccountStore(home: home, providers: [:])
+        let staleResolve = Task {
+            await stale.resolve(integration: integration, detected: [nil: reading])
+        }
+        await gate.waitUntilStarted()
+        try await remover.removeConnection(for: integration, accountID: "account-a")
+        await gate.release()
+
+        let staleResult = await staleResolve.value
+        #expect(staleResult["account-a"] == nil)
+        #expect(await SubscriptionAccountStore(home: home, providers: [:]).accountSnapshots().isEmpty)
+        let current = SubscriptionAccountStore(home: home, providers: [:])
+        let rediscovered = await current.resolve(integration: integration, detected: [nil: reading])
+        #expect(rediscovered["account-a"]?.freshness == .fresh)
     }
 
     // Defect: treating a provider Retry-After as source-specific and immediately retrying the same

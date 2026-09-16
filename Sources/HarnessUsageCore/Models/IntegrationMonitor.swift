@@ -10,6 +10,37 @@ public struct UsageReloadPolicy: Sendable, Equatable {
     }
 }
 
+// Account-backed monitor results carry an internal disk generation to the Engine boundary. Other
+// integrations use the public readings-only initializer and require no acceptance work.
+struct AccountReloadValidationToken: Sendable, Equatable {
+    let integration: Integration
+    let generation: UInt64?
+}
+
+public struct IntegrationReloadResult: Sendable {
+    public let readings: [String?: UsageSnapshot]
+    let accountValidationToken: AccountReloadValidationToken?
+
+    public init(readings: [String?: UsageSnapshot]) {
+        self.readings = readings
+        self.accountValidationToken = nil
+    }
+
+    init(
+        readings: [String?: UsageSnapshot],
+        accountValidationToken: AccountReloadValidationToken
+    ) {
+        self.readings = readings
+        self.accountValidationToken = accountValidationToken
+    }
+}
+
+public enum IntegrationReloadDisposition: Sendable {
+    case accepted
+    case superseded(current: [String?: UsageSnapshot])
+    case validationFailed(current: [String?: UsageSnapshot])
+}
+
 // A usage-reporting integration monitor. Each integration provides its own conforming actor under
 // `Integrations/<name>/`. The Engine holds a `[Integration: IntegrationMonitor]` and iterates it,
 // with no integration-specific knowledge. Each monitor owns its own throttling and caching.
@@ -34,6 +65,14 @@ public protocol IntegrationMonitor: Sendable {
     func reloadProfiles(
         wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
     ) async -> [String?: UsageSnapshot]
+
+    // Engine-only acceptance boundary. Account wrappers attach their persisted detection generation
+    // to the result and validate it immediately before consumption. Ordinary monitors use the default
+    // readings-only result and are always accepted.
+    func reloadForEngine(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> IntegrationReloadResult
+    func disposition(for result: IntegrationReloadResult) async -> IntegrationReloadDisposition
 
     // Directories whose file events mean this monitor has new data. The Engine watches them via
     // FSEvents and reloads the monitor only when one fires, plus a slow heartbeat.
@@ -72,6 +111,19 @@ extension IntegrationMonitor {
         wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
     ) async -> [String?: UsageSnapshot] {
         await reloadProfiles(wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected)
+    }
+
+    public func reloadForEngine(
+        wantUsageEstimate: Bool, includeDetected: Bool, policy: UsageReloadPolicy
+    ) async -> IntegrationReloadResult {
+        IntegrationReloadResult(
+            readings: await reloadProfiles(
+                wantUsageEstimate: wantUsageEstimate, includeDetected: includeDetected,
+                policy: policy))
+    }
+
+    public func disposition(for result: IntegrationReloadResult) async -> IntegrationReloadDisposition {
+        .accepted
     }
 
     public nonisolated var watchPaths: [URL] { [] }

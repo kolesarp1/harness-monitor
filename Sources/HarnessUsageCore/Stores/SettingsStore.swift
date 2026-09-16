@@ -86,6 +86,7 @@ import Observation
             cardTrigger: CardTrigger(rawValue: str("cardTrigger")) ?? def.cardTrigger,
             updateInterval: UsageUpdateInterval(rawValue: d.integer(forKey: "updateIntervalSeconds"))
                 ?? def.updateInterval,
+            hideInactiveAccounts: bool("hideInactiveAccounts", def.hideInactiveAccounts),
             notchScale: clamped("notchScale", def.notchScale, Settings.notchScaleRange),
             providerOrder: order,
             providers: providers,
@@ -99,6 +100,7 @@ import Observation
         d.set(s.criticalAt, forKey: "criticalAt")
         d.set(s.cardTrigger.rawValue, forKey: "cardTrigger")
         d.set(s.updateInterval.rawValue, forKey: "updateIntervalSeconds")
+        d.set(s.hideInactiveAccounts, forKey: "hideInactiveAccounts")
         d.set(s.notchScale, forKey: "notchScale")
         d.set(s.providerOrder.map(\.rawValue), forKey: "providerOrder")
         d.set(s.accountNames, forKey: "accountNames")

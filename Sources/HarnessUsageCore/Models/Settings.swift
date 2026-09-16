@@ -79,6 +79,10 @@ public struct Settings: Equatable, Sendable {
     public var cardTrigger: CardTrigger
     public var updateInterval: UsageUpdateInterval
 
+    // Presentation-only: disconnected remembered accounts remain in Settings and continue refreshing,
+    // but their stale rings can be omitted from the notch.
+    public var hideInactiveAccounts: Bool
+
     // The notch's size, as a multiplier on the design frame's own scale (1 = a 44pt ring).
     public var notchScale: Double
 
@@ -102,7 +106,7 @@ public struct Settings: Equatable, Sendable {
     public init(
         usageLayout: UsageLayout, warningAt: Double, criticalAt: Double,
         cardTrigger: CardTrigger = .hover, updateInterval: UsageUpdateInterval = .fiveMinutes,
-        notchScale: Double = 1,
+        hideInactiveAccounts: Bool = false, notchScale: Double = 1,
         providerOrder: [UsageKey] = [], providers: [Integration: ProviderConfig] = [:],
         accountNames: [String: String] = [:]
     ) {
@@ -111,6 +115,7 @@ public struct Settings: Equatable, Sendable {
         self.criticalAt = criticalAt
         self.cardTrigger = cardTrigger
         self.updateInterval = updateInterval
+        self.hideInactiveAccounts = hideInactiveAccounts
         self.notchScale = notchScale
         self.providerOrder = providerOrder
         self.providers = providers

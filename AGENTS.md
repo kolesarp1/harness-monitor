@@ -111,7 +111,9 @@ Resources/       icon-light.png, icon-dark.png
   Deduplicate by provider identity, never email. Prefer healthy owned login, then matching local
   credentials, then a retained reading. Settings metadata says login, local or both for recorded methods;
   health is separate. Disconnected readings retain their age, with grey dashed rings; passed resets
-  show Reset without a percentage. No account-data migrations are required.
+  show Reset without a percentage. General's Hide inactive accounts hides disconnected rings only;
+  Settings keeps their management rows. Accounts without a current local source can be forgotten;
+  active local credentials are never removed. No account-data migrations are required.
 - **Claude has two usage tiers.** OAuth supplies the 5h, weekly, and Fable windows. The local transcript
   estimator supplies today's tokens and cost. The last successful OAuth reading is retained across
   refreshes so the meters don't flap inside the selected cadence.
@@ -134,7 +136,9 @@ Resources/       icon-light.png, icon-dark.png
 - **Account metadata shares one layout.** `MetadataRow` separates nonempty items with muted `|` glyphs.
   Settings puts name and plan together, then email, detected paths and provenance below. Card headers
   show avatar, name, plan and optional email only. Rename shows plan, paths and provenance. Healthy
-  rows omit redundant Live text; fallback/disconnected status replaces normal second-line metadata.
+  rows omit redundant Live text; fallback status replaces normal second-line metadata. Disconnected
+  rows retain email, detected paths and provenance, followed by compact age on that same left line;
+  any error appears separately below.
   One native ellipsis menu holds Rename, contextual removal and applicable Reconnect. Only actionable
   reconnect also gets an inline button. Add account is a quiet full-width row with a dashed plus tile.
 - **Per-provider config** (`visible`, `scope`, `showExtraCaps`, `showTokenEstimate`) persists sparsely
