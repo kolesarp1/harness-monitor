@@ -111,7 +111,7 @@ private func oauthJWT(_ object: [String: Any]) throws -> String {
         #expect(identity.id == "workspace-9")
         #expect(identity.name == "Codex Person")
         #expect(identity.email == "codex@example.com")
-        #expect(identity.plan == "Pro Lite")
+        #expect(identity.plan == "Pro 5x")
         #expect(credential.expiresAt == Date(timeIntervalSince1970: 5_600))
     }
 

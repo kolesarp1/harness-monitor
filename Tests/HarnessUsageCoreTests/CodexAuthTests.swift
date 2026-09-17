@@ -64,7 +64,7 @@ private let expected = Date(timeIntervalSince1970: 1_766_000_000)
     #expect(parsed.identityId == "acct-42")
     #expect(parsed.name == "alex.k")
     #expect(parsed.email == "alex@example.com")
-    #expect(parsed.plan == "Pro Lite")
+    #expect(parsed.plan == "Pro 5x")
     #expect(parsed.expiresAt == expected)
     #expect(parsed.isExpired(now: expected.addingTimeInterval(1)))
     #expect(parsed.isExpired(now: expected.addingTimeInterval(-1)) == false)
@@ -79,8 +79,8 @@ private let expected = Date(timeIntervalSince1970: 1_766_000_000)
 // Defect: only a few Codex plan variants becoming readable while known workspace plans leak codes.
 @Test(
     arguments: [
-        ("free", "Free"), ("go", "Go"), ("plus", "Plus"), ("pro", "Pro"),
-        ("prolite", "Pro Lite"), ("team", "Team"),
+        ("free", "Free"), ("go", "Go"), ("plus", "Plus"), ("pro", "Pro 20x"),
+        ("prolite", "Pro 5x"), ("Pro 5x", "Pro 5x"), ("team", "Team"),
         ("self_serve_business_prolite", "Self Serve Business ProLite"),
         ("self_serve_business_usage_based", "Self Serve Business Usage Based"),
         ("business", "Business"), ("ent26", "Enterprise"),
@@ -95,7 +95,7 @@ func knownPlanLabelsMatchCodex(_ raw: String, _ expected: String) {
 }
 
 @Test func planLabelsHandlePersistedCapitalizationAndUnknownValues() {
-    #expect(Integration.codex.planDisplayName("Prolite") == "Pro Lite")
+    #expect(Integration.codex.planDisplayName("Prolite") == "Pro 5x")
     #expect(Integration.codex.planDisplayName("SELF_SERVE_BUSINESS_USAGE_BASED") == "Self Serve Business Usage Based")
     #expect(CodexAuth.planLabel("future_plan") == "Future_plan")
     #expect(CodexAuth.planLabel("  ") == nil)

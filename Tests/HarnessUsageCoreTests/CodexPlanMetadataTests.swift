@@ -28,7 +28,7 @@ import Testing
             """.utf8)
         let snapshot = try #require(
             CodexUsageClient.snapshot(fromResponseData: data, now: Date(timeIntervalSince1970: 1_000)))
-        #expect(snapshot.account?.plan == "Pro Lite")
+        #expect(snapshot.account?.plan == "Pro 5x")
         #expect(snapshot.account?.plan == Integration.codex.planDisplayName("Prolite"))
     }
 }

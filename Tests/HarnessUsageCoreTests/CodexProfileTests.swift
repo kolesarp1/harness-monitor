@@ -89,7 +89,7 @@ private func writeCodexProfile(
     #expect(
         personalReading.account
             == UsageAccount(
-                id: "acct-personal", email: "alex@example.com", plan: "Pro Lite",
+                id: "acct-personal", email: "alex@example.com", plan: "Pro 5x",
                 location: "~/.codex", suggestedName: "alex.k"))
     #expect(
         workReading.account

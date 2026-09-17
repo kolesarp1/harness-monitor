@@ -131,7 +131,7 @@ Resources/       icon-light.png, icon-dark.png
   falling back to the email prefix, and can be renamed from its Settings pane. The avatar letters from
   that assigned name.
 - **Plan labels use provider-specific presentation.** `Integration.planDisplayName` delegates to the
-  descriptor's policy. Known codes become readable labels such as Max 5x and Pro Lite; unknown names
+  descriptor's policy. Known codes become readable labels such as Max 5x and Pro 5x; unknown names
   remain visible. Apply this at presentation too, so saved raw names need no migration.
 - **Account metadata shares one layout.** `MetadataRow` separates nonempty items with muted `|` glyphs.
   Settings puts name and plan together, then email, detected paths and provenance below. Card headers
