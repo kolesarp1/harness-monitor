@@ -173,14 +173,15 @@ private let farReset = t0.addingTimeInterval(100_000)
     #expect(window(recovered, id: "5h")?.utilization == 42)
 }
 
-// Defect: a transient 401 during a routine CLI token rotation permanently killing the primary source.
-@Test func a401WithARotatedTokenReArmsInsteadOfLatching() async throws {
+// Defects: a transient 401 during a routine CLI token rotation permanently killing the primary source,
+// or the rotation's note marking the account disconnected (a grey ring) until the next due poll.
+@Test func a401WithARotatedTokenRetriesTheAdoptedTokenAtOnce() async throws {
     let h = Harness(
         now: t0, keychainBlob: keychainBlob(token: "tok-old"),
         outcomes: [
             .ok(oauthSnapshot(session: 20, week: 8, at: t0, resetsAt: farReset)),
             .unauthorized(status: 401),
-            .ok(oauthSnapshot(session: 33, week: 12, at: t0.addingTimeInterval(800), resetsAt: farReset)),
+            .ok(oauthSnapshot(session: 33, week: 12, at: t0.addingTimeInterval(400), resetsAt: farReset)),
         ])
     let provider = h.provider()
 
@@ -188,20 +189,36 @@ private let farReset = t0.addingTimeInterval(100_000)
     let first = await provider.refresh(force: true, wantEstimate: false)
     #expect(window(first, id: "5h")?.utilization == 20)
 
-    // The CLI rotates its token; our cached copy is now stale, so the next poll 401s.
+    // The CLI rotates its token; our cached copy is now stale, so the next poll 401s and the same
+    // refresh goes out again with the adopted token.
+    h.setKeychainBlob(keychainBlob(token: "tok-new"))
+    h.advance(400)
+    let recovered = await provider.refresh(force: true, wantEstimate: false)
+    #expect(h.fetchTokens == ["tok-old", "tok-old", "tok-new"])
+    #expect(recovered.note == nil)
+    #expect(recovered.freshness == .fresh)
+    #expect(window(recovered, id: "5h")?.utilization == 33)
+}
+
+// Defect: the rotation retry looping, or a rejected adopted token being reported as live. The retry is
+// one request, and its rejection latches like any other.
+@Test func aRotatedTokenThatIsAlsoRejectedLatchesAfterOneRetry() async throws {
+    let h = Harness(
+        now: t0, keychainBlob: keychainBlob(token: "tok-old"),
+        outcomes: [
+            .ok(oauthSnapshot(session: 20, week: 8, at: t0, resetsAt: farReset)),
+            .unauthorized(status: 401),
+        ])
+    let provider = h.provider()
+
+    _ = await provider.refresh(force: true, wantEstimate: false)
     h.setKeychainBlob(keychainBlob(token: "tok-new"))
     h.advance(400)
     let rejected = await provider.refresh(force: true, wantEstimate: false)
-    #expect(rejected.note == "Claude login token was rotated; retrying")
-    // Defect: clearing the retained OAuth reading before deciding — a routine rotation would blank the
-    // OAuth side of the merge for a full 300s even though the reading is still true.
-    #expect(window(rejected, id: "5h")?.utilization == 20)
 
-    // Not latched: the next due poll goes out with the adopted token and succeeds.
-    h.advance(400)
-    let recovered = await provider.refresh(force: true, wantEstimate: false)
-    #expect(h.fetchCalls == 3)
-    #expect(window(recovered, id: "5h")?.utilization == 33)
+    #expect(h.fetchTokens == ["tok-old", "tok-old", "tok-new"])
+    #expect(rejected.note == "Claude login token expired or rejected")
+    #expect(rejected.freshness == .disconnected)
 }
 
 // Defect: latching on a rotation but NOT on a genuinely rejected login — the endpoint would be hit

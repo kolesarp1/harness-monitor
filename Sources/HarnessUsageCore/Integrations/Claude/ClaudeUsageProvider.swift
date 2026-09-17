@@ -203,6 +203,14 @@ public actor ClaudeUsageProvider {
         guard now().timeIntervalSince(lastOAuthAttempt) >= Self.oauthFloor else { return }
         lastOAuthAttempt = now()
         guard let token = await resolveToken() else { return }
+        // The CLI rotates its token routinely. Retrying the adopted token now, once, keeps that rotation
+        // from publishing the retained reading as disconnected until the next due attempt.
+        if let rotated = await fetchOAuth(token) { await fetchOAuth(rotated) }
+    }
+
+    // One request with one token. Returns the adopted token when a 401 turned out to be a rotation.
+    @discardableResult
+    private func fetchOAuth(_ token: ClaudeCredentials.Token) async -> ClaudeCredentials.Token? {
         switch await fetchUsage(token, now()) {
         case .ok(let snapshot):
             note = nil
@@ -210,7 +218,7 @@ public actor ClaudeUsageProvider {
             cachedToken = token
             lastOAuthSnapshot = snapshot
         case .unauthorized(let status):
-            await handleUnauthorized(previous: token, status: status)
+            return await handleUnauthorized(previous: token, status: status)
         case .rateLimited(let retryAfter):
             // Hold off until whichever is later: the server's own hint, or the standard floor. Kept
             // apart from `lastOAuthAttempt` because the two answer to different people —
@@ -220,6 +228,7 @@ public actor ClaudeUsageProvider {
         case .failed:
             note = "Could not reach the Claude usage endpoint"
         }
+        return nil
     }
 
     // Resolve env/file every due cycle after a rejection. A Keychain read is allowed only on its
@@ -268,32 +277,33 @@ public actor ClaudeUsageProvider {
 
     // A 401 usually means the CLI rotated its token and our cached copy is simply behind — latching
     // OAuth off for the run on the first one would kill the primary source over a routine rotation.
-    // So: re-resolve exactly once. A DIFFERENT token is adopted and retried on the next due fetch; the
+    // So: re-resolve exactly once. A DIFFERENT token is adopted and returned for the caller to retry; the
     // SAME token means the login itself is rejected, and only then does the latch engage.
     // The retained snapshot is dropped only where the latch engages: a rotation is a routine event and
     // the reading it produced minutes ago is still the truth about the account, so clearing it up front
-    // would blank the merge's OAuth side for a full 300s over nothing.
-    private func handleUnauthorized(previous: ClaudeCredentials.Token, status: Int) async {
+    // would blank the merge's OAuth side for a full cadence over nothing.
+    private func handleUnauthorized(previous: ClaudeCredentials.Token, status: Int) async -> ClaudeCredentials.Token? {
         cachedToken = nil
         guard status == 401 else {
             oauthForbidden = true
             rejectedToken = nil
             lastOAuthSnapshot = nil
             note = "Claude usage access was refused by the server"
-            return
+            return nil
         }
         let wasAlreadyRejected = rejectedToken != nil
         rejectedToken = previous
-        guard let refreshed = await resolveToken(forceKeychain: !wasAlreadyRejected) else { return }
+        guard let refreshed = await resolveToken(forceKeychain: !wasAlreadyRejected) else { return nil }
         guard refreshed != previous else {
             cachedToken = nil
             lastOAuthSnapshot = nil
             note = "Claude login token expired or rejected"
-            return
+            return nil
         }
         rejectedToken = nil
         cachedToken = refreshed
         note = "Claude login token was rotated; retrying"
+        return refreshed
     }
 
     @discardableResult

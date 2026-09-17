@@ -60,7 +60,7 @@ if [[ "${NATIVE_ONLY:-0}" == "1" ]]; then
 else
   echo "==> universal release build (${VERSION})"
   swift build -c release --arch arm64 --arch x86_64
-  BIN=".build/apple/Products/Release/${APP_NAME}"
+  BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/${APP_NAME}"
 fi
 
 echo "==> verify slices"
