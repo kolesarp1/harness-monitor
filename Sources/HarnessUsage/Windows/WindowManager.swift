@@ -11,7 +11,8 @@ import SwiftUI
     private let integrations: IntegrationStore?
     // The tracked accounts, in `accounts.json` order — one Settings pane each.
     private let accounts: [AccountConfig]
-    private let onAccountSourceChanged: @MainActor (Integration) async -> Void
+    private let controllerAudit: ControllerAuditStore
+    private let onAccountsChanged: @MainActor () async -> Void
     private let onAddSubscription: @MainActor (Harness) -> Void
     private let onDeleteSubscription: @MainActor (Integration) -> Void
 
@@ -19,8 +20,8 @@ import SwiftUI
 
     init(
         usage: UsageStore, settings: SettingsStore, integrations: IntegrationStore? = nil,
-        accounts: [AccountConfig],
-        onAccountSourceChanged: @escaping @MainActor (Integration) async -> Void = { _ in },
+        accounts: [AccountConfig], controllerAudit: ControllerAuditStore,
+        onAccountsChanged: @escaping @MainActor () async -> Void = {},
         onAddSubscription: @escaping @MainActor (Harness) -> Void = { _ in },
         onDeleteSubscription: @escaping @MainActor (Integration) -> Void = { _ in }
     ) {
@@ -28,7 +29,8 @@ import SwiftUI
         self.settings = settings
         self.integrations = integrations
         self.accounts = accounts
-        self.onAccountSourceChanged = onAccountSourceChanged
+        self.controllerAudit = controllerAudit
+        self.onAccountsChanged = onAccountsChanged
         self.onAddSubscription = onAddSubscription
         self.onDeleteSubscription = onDeleteSubscription
     }
@@ -52,7 +54,8 @@ import SwiftUI
         let host = NSHostingController(
             rootView: SettingsWindow(
                 settings: settings, integrations: integrations, usage: usage, accounts: accounts,
-                onAccountSourceChanged: onAccountSourceChanged,
+                controllerAudit: controllerAudit,
+                onAccountsChanged: onAccountsChanged,
                 onAddSubscription: onAddSubscription,
                 onDeleteSubscription: onDeleteSubscription,
                 onClose: { [weak self] in self?.closeSettings() }))

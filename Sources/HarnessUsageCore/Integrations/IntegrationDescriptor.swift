@@ -26,10 +26,17 @@ public protocol IntegrationDescriptor: Sendable {
     /// no credential-based endpoint to ask. Default: nil — a harness whose usage is purely local
     /// (opencode) has nothing a remote box could answer.
     func remoteProbe(configDir: String) -> RemoteProbe?
+
+    /// An explicit controller for two existing profiles, when this provider supports exchanging
+    /// their credentials on their owning machine.
+    func credentialController(first: AccountConfig, second: AccountConfig) -> (any CredentialController)?
 }
 
 extension IntegrationDescriptor {
     public func remoteProbe(configDir: String) -> RemoteProbe? { nil }
+    public func credentialController(first: AccountConfig, second: AccountConfig) -> (any CredentialController)? {
+        nil
+    }
 }
 
 // The single per-harness registry. Built over `Harness.allCases`, so it is always complete —
@@ -61,6 +68,6 @@ public func makeMonitors(
 ) -> [Integration: any IntegrationMonitor] {
     Dictionary(
         uniqueKeysWithValues: accounts.map {
-            ($0.integration, $0.harness.descriptor.makeMonitor(home: home, account: $0))
+            ($0.integration, $0.harness.descriptor.makeMonitor(home: home, account: $0.source(in: accounts)))
         })
 }

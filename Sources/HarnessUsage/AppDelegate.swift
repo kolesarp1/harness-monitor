@@ -32,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let settings = SettingsStore(defaults: defaults, accounts: accounts.map(\.integration))
         let integrationStore = IntegrationStore(home: home, accounts: accounts)
+        let controllerAudit = ControllerAuditStore(
+            url: home.appendingPathComponent(".harness-usage/controller-audit.jsonl"))
 
         if !isMock {
             integrationStore.refresh()
@@ -66,15 +68,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.engine = engine
         let windows = WindowManager(
             usage: engine.usage, settings: engine.settings, integrations: engine.integrations,
-            accounts: accounts,
-            onAccountSourceChanged: { [weak engine] integration in
-                guard let engine,
-                    let account = AccountsFile.load(at: Accounts.configuredURL)?.first(where: {
-                        $0.integration == integration
+            accounts: accounts, controllerAudit: controllerAudit,
+            onAccountsChanged: { [weak engine] in
+                guard let engine else { return }
+                let configured = AccountsFile.load(at: Accounts.configuredURL) ?? []
+                // A source edit can affect several assigned slots, while an assignment changes a
+                // slot's resolved login. Replace the whole tiny map in one batch so this action makes
+                // one refresh pass, rather than one all-account pass per configured account.
+                let replacements: [Integration: any IntegrationMonitor] = Dictionary(
+                    uniqueKeysWithValues: configured.map { account in
+                        let monitor = account.harness.descriptor.makeMonitor(
+                            home: home, account: account.source(in: configured))
+                        return (account.integration, monitor)
                     })
-                else { return }
-                let monitor = account.harness.descriptor.makeMonitor(home: home, account: account)
-                await engine.replaceMonitor(monitor, for: integration)
+                await engine.replaceMonitors(replacements)
             },
             onAddSubscription: { harness in
                 guard AccountsFile.addSubscription(harness: harness, at: Accounts.configuredURL) != nil else { return }

@@ -29,16 +29,21 @@ public struct AccountConfig: Sendable, Equatable {
     /// (`~/.claude`, `~/.codex`). A leading `~` is expanded against the RELEVANT home — this Mac's for
     /// a local account, the remote login's for an SSH one — so one spelling works on both.
     public var configDir: String?
+    /// The account slug whose login this operational ring monitors. nil means this ring's own
+    /// login; an empty string names the default account for this harness. This is an assignment
+    /// only — it never changes a provider's login or copies a credential.
+    public var usageSource: String?
 
     public init(
         harness: Harness, account: String = "", label: String = "", host: AccountHost = .local,
-        configDir: String? = nil
+        configDir: String? = nil, usageSource: String? = nil
     ) {
         self.harness = harness
         self.account = account
         self.label = label
         self.host = host
         self.configDir = configDir
+        self.usageSource = usageSource
     }
 
     public var integration: Integration { Integration(harness: harness, account: account) }
@@ -64,6 +69,17 @@ public struct AccountConfig: Sendable, Equatable {
     /// two logins of one harness cannot overwrite each other's usage cache.
     public var cacheDirName: String {
         account.isEmpty ? harness.rawValue : "\(harness.rawValue)-\(account)"
+    }
+
+    /// The login profile assigned to this operational ring. Invalid or missing assignments safely
+    /// fall back to the ring's own configured login.
+    public func source(in accounts: [AccountConfig]) -> AccountConfig {
+        guard let usageSource,
+            let source = accounts.first(where: {
+                $0.harness == harness && $0.account == usageSource
+            })
+        else { return self }
+        return source
     }
 }
 

@@ -25,8 +25,9 @@ import Foundation
         let fm = FileManager.default
         let found = Set(
             accounts.filter { account in
-                account.host.isRemote
-                    || fm.fileExists(atPath: account.resolvedConfigDir(home: home))
+                let source = account.source(in: accounts)
+                return source.host.isRemote
+                    || fm.fileExists(atPath: source.resolvedConfigDir(home: home))
             }.map(\.integration))
         if found != detected { detected = found }  // only notify observers on an actual change
     }

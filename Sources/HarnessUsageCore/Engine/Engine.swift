@@ -165,15 +165,23 @@ import Foundation
         await tick()
     }
 
-    /// Swap one account's monitor after its Settings source changes. The integration identity stays
-    /// the same, so rings and provider preferences remain intact; only the place its data is read
-    /// from changes. Rebuilding the watcher/poll schedule makes the replacement live immediately.
-    public func replaceMonitor(_ monitor: any IntegrationMonitor, for integration: Integration) async {
+    /// Swap monitors after a Settings source or assignment change. The integration identities stay
+    /// the same, so rings and provider preferences remain intact; only the place each one's data is
+    /// read from changes. Rebuilding the watcher/poll schedule makes the replacements live at once.
+    ///
+    /// The whole related set is replaced in one operation, followed by exactly one explicit
+    /// refresh: a single assignment can change several effective sources, and replacing them
+    /// one-by-one would make every intermediate step call `refreshNow()`, producing a burst of
+    /// duplicate provider requests and, for remote accounts, an avoidable endpoint-wide 429.
+    public func replaceMonitors(_ replacements: [Integration: any IntegrationMonitor]) async {
+        guard !replacements.isEmpty else { return }
         stop()
-        monitors[integration] = monitor
-        lastReload.removeValue(forKey: integration)
-        lastSnapshots.removeValue(forKey: integration)
-        usage.byIntegration.removeValue(forKey: integration)
+        for (integration, monitor) in replacements {
+            monitors[integration] = monitor
+            lastReload.removeValue(forKey: integration)
+            lastSnapshots.removeValue(forKey: integration)
+            usage.byIntegration.removeValue(forKey: integration)
+        }
         pollDriven = []
         pollIntervals = [:]
         alwaysPolled = []

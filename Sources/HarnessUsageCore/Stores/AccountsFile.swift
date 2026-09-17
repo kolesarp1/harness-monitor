@@ -29,6 +29,7 @@ public enum AccountsFile {
         let label: String?
         let host: String?
         let configDir: String?
+        let usageSource: String?
     }
 
     public static func load(at url: URL) -> [AccountConfig]? {
@@ -71,7 +72,8 @@ public enum AccountsFile {
             }
             let config = AccountConfig(
                 harness: harness, account: slug, label: entry.label ?? "", host: host,
-                configDir: entry.configDir?.isEmpty == true ? nil : entry.configDir)
+                configDir: entry.configDir?.isEmpty == true ? nil : entry.configDir,
+                usageSource: entry.usageSource)
             // A repeated key would put two rings under one identity, which is not a state SwiftUI has
             // an answer for — the same rule `providerOrder` applies on the way in.
             guard seen.insert(config.integration).inserted else {
@@ -79,6 +81,20 @@ public enum AccountsFile {
                 continue
             }
             accounts.append(config)
+        }
+        // An assignment may only point at another configured profile of the same harness. It is
+        // deliberately not followed recursively: every account remains a reusable login profile.
+        for index in accounts.indices {
+            guard let source = accounts[index].usageSource else { continue }
+            let hasSource = accounts.contains { candidate in
+                candidate.harness == accounts[index].harness && candidate.account == source
+            }
+            guard hasSource else {
+                warn(
+                    "unknown usage source \"\(source)\" for \(accounts[index].integration.rawValue) — using its own login")
+                accounts[index].usageSource = nil
+                continue
+            }
         }
         guard !accounts.isEmpty else {
             warn("no usable accounts — falling back to the default accounts")
@@ -161,6 +177,38 @@ public enum AccountsFile {
         return (try? output.write(to: url, options: .atomic)) != nil
     }
 
+    /// Assign an operational ring to one of its harness's configured login profiles. Passing the
+    /// ring's own account slug (or nil for the default ring) clears the assignment.
+    @discardableResult
+    public static func setUsageSource(
+        _ source: Integration, for integration: Integration, at url: URL
+    ) -> Bool {
+        guard source.harness == integration.harness,
+            let data = try? Data(contentsOf: url),
+            var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            var entries = root["accounts"] as? [[String: Any]],
+            let targetIndex = entries.firstIndex(where: {
+                ($0["harness"] as? String) == integration.harness.rawValue
+                    && ($0["account"] as? String ?? "") == integration.account
+            }),
+            entries.contains(where: {
+                ($0["harness"] as? String) == source.harness.rawValue
+                    && ($0["account"] as? String ?? "") == source.account
+            })
+        else { return false }
+
+        if source.account == integration.account {
+            entries[targetIndex].removeValue(forKey: "usageSource")
+        } else {
+            entries[targetIndex]["usageSource"] = source.account
+        }
+        root["accounts"] = entries
+        guard JSONSerialization.isValidJSONObject(root),
+            let output = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        else { return false }
+        return (try? output.write(to: url, options: .atomic)) != nil
+    }
+
     /// Append a new subscription with a stable, unused account slug. Its source starts local; the
     /// newly created Settings pane lets the user choose a remote host and token location.
     public static func addSubscription(harness: Harness, at url: URL) -> AccountConfig? {
@@ -203,6 +251,15 @@ public enum AccountsFile {
             })
         else { return false }
         entries.remove(at: index)
+        // Slots assigned to a deleted profile safely resume monitoring their own login. Leaving a
+        // dangling reference would make the JSON's intent differ from the live fallback behaviour.
+        let dependents = entries.indices.filter { remainingIndex in
+            (entries[remainingIndex]["harness"] as? String) == integration.harness.rawValue
+                && (entries[remainingIndex]["usageSource"] as? String) == integration.account
+        }
+        for remainingIndex in dependents {
+            entries[remainingIndex].removeValue(forKey: "usageSource")
+        }
         root["accounts"] = entries
         guard JSONSerialization.isValidJSONObject(root),
             let output = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
@@ -228,6 +285,7 @@ public enum AccountsFile {
             "             another machine. Omit for this Mac.",
             "  configDir  the harness's config directory, e.g. ~/.claude-work. Omit for the",
             "             default (~/.claude, ~/.codex). ~ expands on the account's OWN machine.",
+            "  usageSource account slug whose login this ring monitors; omit for its own login.",
             "",
             "A remote account reports its live meters only: the query runs over ssh ON that",
             "machine and only the resulting percentages come back, so the token never leaves it.",

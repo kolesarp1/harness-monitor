@@ -28,6 +28,10 @@ struct ClaudeDescriptor: IntegrationDescriptor {
             runSecurity: ClaudeCredentials.securityCLIReader())
     }
 
+    func credentialController(first: AccountConfig, second: AccountConfig) -> (any CredentialController)? {
+        ClaudeCredentialController(first: first, second: second)
+    }
+
     // The same endpoint, beta header and user agent as `ClaudeOAuthUsage`, run on the account's own
     // machine. The token is read out of that machine's credentials file and never leaves it — on
     // Linux Claude Code keeps the blob in `<configDir>/.credentials.json`, which is why a remote

@@ -108,6 +108,33 @@ private func parse(_ json: String) -> [AccountConfig]? {
     #expect(accounts?[1].integration.rawValue == "claude#work")
 }
 
+@Test func anOperationalSlotCanUseAnotherAccountsLoginProfile() throws {
+    let accounts = parse(
+        """
+        { "accounts": [
+          { "harness": "claude", "label": "Personal", "configDir": "~/.claude-personal" },
+          { "harness": "claude", "account": "work", "label": "Work",
+            "configDir": "~/.claude-work", "usageSource": "" }
+        ] }
+        """)!
+    let work = try #require(accounts.last)
+    let source = work.source(in: accounts)
+    #expect(source.integration == .claude)
+    #expect(source.configDir == "~/.claude-personal")
+    // The Work login remains independently configured, so the assignment can later be swapped back.
+    #expect(work.configDir == "~/.claude-work")
+}
+
+@Test func invalidOperationalAssignmentFallsBackToTheSlotsOwnLogin() {
+    var warnings: [String] = []
+    let accounts = AccountsFile.parse(
+        Data(#"{ "accounts": [{ "harness": "codex", "account": "a", "usageSource": "missing" }] }"#.utf8),
+        warn: { warnings.append($0) })!
+    #expect(accounts[0].usageSource == nil)
+    #expect(accounts[0].source(in: accounts).integration == accounts[0].integration)
+    #expect(warnings.contains { $0.contains("unknown usage source") })
+}
+
 // One bad entry must not take its siblings with it — the file is a list of independent accounts.
 @Test func oneBadEntryIsDroppedAndTheRestSurvive() {
     let accounts = parse(
@@ -202,4 +229,23 @@ private func parse(_ json: String) -> [AccountConfig]? {
 
     #expect(AccountsFile.setHost(nil, for: work, at: url))
     #expect(AccountsFile.load(at: url)?.first?.host == .local)
+}
+
+@Test func assigningAnOperationalSlotPreservesBothLoginProfiles() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("accounts.json")
+    try Data(
+        #"{"accounts":[{"harness":"claude","account":"a","configDir":"~/.claude-a"},{"harness":"claude","account":"b","configDir":"~/.claude-b"}]}"#.utf8
+    ).write(to: url)
+
+    let a = Integration(harness: .claude, account: "a")
+    let b = Integration(harness: .claude, account: "b")
+    #expect(AccountsFile.setUsageSource(a, for: b, at: url))
+    let accounts = try #require(AccountsFile.load(at: url))
+    let savedB = try #require(accounts.first { $0.integration == b })
+    #expect(savedB.usageSource == "a")
+    #expect(savedB.source(in: accounts).configDir == "~/.claude-a")
+    #expect(accounts.first { $0.integration == a }?.configDir == "~/.claude-a")
 }
