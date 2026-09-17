@@ -54,9 +54,14 @@ Resources/
 
 ## Account and data rules
 
-- One ring represents one operational account. Accounts and their profile
-  assignments are stored in `~/.harness-usage/accounts.json`; `AccountConfig`
-  and `AccountsFile` own that format.
+- One ring represents one lane. A LANE is a directory a provider CLI runs
+  against; an ACCOUNT is a login that owns quota. No account belongs to a lane:
+  a login can be swapped in, copied into both lanes, or parked, so a lane is
+  named by its letter and directory (`Lane`) and an account by the login email
+  the provider itself reports. A user-typed label must never stand in for
+  either — it cannot follow a login when it moves. Lanes are stored in
+  `~/.harness-usage/accounts.json`; `AccountConfig` and `AccountsFile` own that
+  format.
 - A controller action must be initiated by the user, name its source and target
   profile in the UI, and be recorded in the app's own audit state. Never
   automatically switch because a quota is exhausted.
@@ -69,11 +74,14 @@ Resources/
   surfaced in UI, or placed in a process argument. Prefer invoking the
   provider's own CLI on the owning machine over manipulating credential files.
 - Claude credential exchange or sharing is an explicit exception when two
-  existing profile directories on the same SSH host need to trade or share a
-  login. Back up both credential files and their `oauthAccount` profile metadata
-  privately on that host before replacing anything; restore from those backups
-  if requested.
+  existing lanes on the same SSH host need to trade or share a login. Park both
+  credential files and their `oauthAccount` profile metadata privately on that
+  host before replacing anything, and load them back if asked.
   Preserve unrelated provider settings, plugins, projects, and transcripts.
+- A parked pair is stored positionally, and which lane each position meant is
+  known only from the local audit record. Anything that reads or loads a parked
+  pair must resolve that orientation first and refuse when it is unknown —
+  guessing puts a login in a lane it never came from.
 - The app may write its own state under `~/.harness-usage` and its `UserDefaults`
   domains. Provider-state writes are allowed only as the direct, user-confirmed
   result of a controller action on that provider profile's owning machine.

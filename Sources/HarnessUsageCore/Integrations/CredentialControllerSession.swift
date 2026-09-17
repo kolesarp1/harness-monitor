@@ -1,43 +1,45 @@
 import Foundation
 
-/// The user-driven half of a controller action: choose a partner profile and an action, run a
-/// dry-run preflight, confirm, apply, and record the result.
+/// The user-driven half of a lane change: pick the other lane and what to do, run a dry-run
+/// preflight, confirm, apply, and record the result.
 ///
 /// This lives in Core rather than in the Settings view so the parts that decide what actually
-/// happens — which profiles are eligible, what a refusal means for the recovery path, what reaches
-/// the audit log — are provider-neutral and testable. It holds profile keys and opaque backup
-/// identifiers only; credentials never leave their owning machine.
+/// happens — which lanes are eligible, what a refusal means for what is parked, what reaches the
+/// audit log — are provider-neutral and testable. It holds lane keys, login emails and opaque
+/// parked-pair identifiers only; credentials never leave their owning machine.
 @MainActor @Observable public final class CredentialControllerSession {
     public enum Action: Sendable, Hashable, CaseIterable {
-        /// Give each profile the other's login.
-        case exchange
-        /// Put this pane's login in both profiles.
+        /// Give each lane the other's login.
+        case swap
+        /// Put this lane's login in both lanes.
         case useOwnInBoth
-        /// Put the partner's login in both profiles.
+        /// Put the other lane's login in both lanes.
         case usePartnerInBoth
     }
 
-    /// A preflighted action waiting for the user to confirm it.
+    /// A preflighted change waiting for the user to confirm it.
     public struct Pending: Sendable, Equatable {
         public let partner: AccountConfig
         public let action: Action
-        /// The backup being restored, or nil when this is a forward change.
-        public let restoring: UUID?
+        /// The parked pair being loaded back into the two lanes, or nil for a swap or copy.
+        public let loading: ParkedLogin?
     }
 
     public let account: AccountConfig
-    /// The configured profiles this account can trade logins with: same harness, same machine,
-    /// distinct profile directory, and a provider that supports the exchange.
+    /// The lanes this one can trade logins with: same harness, same machine, distinct directory,
+    /// and a provider that supports the exchange.
     public let candidates: [AccountConfig]
 
-    public var action: Action = .exchange
+    public var action: Action = .swap
     public private(set) var partner: AccountConfig?
     public private(set) var isRunning = false
     public private(set) var message = ""
-    /// The remote backup the "recover originals" path would restore, if any.
-    public private(set) var restorableBackup: UUID?
+    /// Login pairs saved on the host by earlier changes, newest first. A lane has no home account,
+    /// so these are offers to load, never a state the lanes are expected to return to.
+    public private(set) var parked: [ParkedLogin] = []
     public private(set) var pending: Pending?
 
+    private let accounts: [AccountConfig]
     private let audit: ControllerAuditStore
     private let makeController: @MainActor (AccountConfig, AccountConfig) -> (any CredentialController)?
 
@@ -51,6 +53,7 @@ import Foundation
                 first.harness.descriptor.credentialController(first: first, second: second)
             }
         self.account = account
+        self.accounts = accounts
         self.audit = audit
         self.makeController = make
         self.candidates = accounts.filter {
@@ -58,124 +61,139 @@ import Foundation
                 && make(account, $0) != nil
         }
         self.partner = candidates.first
-        self.restorableBackup = candidates.first.flatMap {
-            Self.latestBackup(pairing: account, with: $0, in: audit)
-        }
-    }
-
-    /// The backup the recovery path would put back for one pair of profiles, if any.
-    private static func latestBackup(
-        pairing account: AccountConfig, with partner: AccountConfig, in audit: ControllerAuditStore
-    ) -> UUID? {
-        audit.latestRestorableBackup(
-            host: account.host.sshAlias ?? "", first: account.integration,
-            second: partner.integration)
     }
 
     private var host: String { account.host.sshAlias ?? "" }
 
-    /// Point the controller at a different partner profile. The recovery offer follows the pair,
-    /// since a backup belongs to the two profiles it was taken from.
+    /// Point the controller at a different lane.
     public func select(_ candidate: Integration) {
         guard !isRunning, let chosen = candidates.first(where: { $0.integration == candidate }) else { return }
         partner = chosen
-        restorableBackup = Self.latestBackup(pairing: account, with: chosen, in: audit)
         message = ""
+        parked = []
     }
 
-    /// Dry-run the configured change. On success the action becomes `pending` for the user to
-    /// confirm; otherwise the refusal is reported and nothing is staged.
-    public func prepare(with candidate: Integration? = nil) async {
-        if let candidate { select(candidate) }
+    /// Ask the host which login pairs are parked there. Safe to call when a lane is signed out.
+    public func refreshParked() async {
+        guard let partner, let controller = makeController(account, partner) else { return }
+        parked = await controller.parkedLogins()
+    }
+
+    /// Dry-run the configured change. On success it becomes `pending` for the user to confirm;
+    /// otherwise the refusal is reported and nothing is staged.
+    public func prepare(_ requested: Action? = nil) async {
         guard !isRunning, let partner, let controller = makeController(account, partner) else { return }
-        let requested = action
+        if let requested { action = requested }
+        let chosen = action
         await run {
             let outcome = await controller.preflight()
             guard outcome == .ready else {
                 self.message = outcome.message
                 return
             }
-            self.pending = Pending(partner: partner, action: requested, restoring: nil)
+            self.pending = Pending(partner: partner, action: chosen, loading: nil)
         }
     }
 
-    /// Dry-run putting the last backup back.
-    public func prepareRestore() async {
-        guard !isRunning, let partner, let backupID = restorableBackup,
-            let controller = makeController(account, partner)
-        else { return }
+    /// Which lane each half of a parked pair came out of. A pair is stored positionally, and the
+    /// audit is the only record of what those positions meant, so everything that reads or writes a
+    /// parked pair goes through this — the display, and the load itself.
+    public func origin(of entry: ParkedLogin) -> (first: AccountConfig, second: AccountConfig)? {
+        guard let logged = audit.entry(forBackup: entry.id),
+            let first = accounts.first(where: { $0.integration == logged.first }),
+            let second = accounts.first(where: { $0.integration == logged.second })
+        else { return nil }
+        return (first, second)
+    }
+
+    /// The controller oriented the way this pair was parked, so each login goes back to the lane it
+    /// came from rather than to whichever lane happens to be showing.
+    private func loader(for entry: ParkedLogin) -> (any CredentialController)? {
+        guard let origin = origin(of: entry) else { return nil }
+        return makeController(origin.first, origin.second)
+    }
+
+    /// Dry-run loading a parked pair back into the two lanes.
+    public func prepareLoad(_ entry: ParkedLogin) async {
+        guard !isRunning, let partner, let controller = loader(for: entry) else {
+            message =
+                "This saved pair predates the app's record of which lane each login came from, so it cannot be loaded safely."
+            return
+        }
         await run {
-            let outcome = await controller.preflightRestore(backupID: backupID)
+            let outcome = await controller.preflightRestore(backupID: entry.id)
             guard outcome == .ready else {
                 self.message = outcome.message
                 return
             }
-            self.pending = Pending(partner: partner, action: self.action, restoring: backupID)
+            self.pending = Pending(partner: partner, action: self.action, loading: entry)
         }
     }
 
     public func cancel() { pending = nil }
 
-    /// Apply the confirmed action. Returns true when the owning profiles changed on the remote
-    /// host, so the caller can refresh what the rings are reading.
+    /// Apply the confirmed change. Returns true when the lanes changed on the owning host, so the
+    /// caller can re-read what they now hold.
     @discardableResult
     public func confirm() async -> Bool {
-        guard let pending, !isRunning, let controller = makeController(account, pending.partner) else { return false }
+        guard let pending, !isRunning else { return false }
+        // A load is oriented by the record of how the pair was parked, and never falls back to the
+        // showing lane pair: the wrong orientation would put each login in the other's lane.
+        let resolved: (any CredentialController)?
+        if let loading = pending.loading {
+            resolved = loader(for: loading)
+        } else {
+            resolved = makeController(account, pending.partner)
+        }
+        guard let controller = resolved else { return false }
         self.pending = nil
-        // Every change is identified by the backup it takes first, so a result that never reaches
-        // this Mac can still be found on the remote host under this identifier.
+        // Every change is identified by the pair it parks first, so a result that never reaches this
+        // Mac can still be found on the host under this identifier.
         let operationID = UUID()
         var changed = false
         await run {
             let outcome: ControllerOutcome
-            if let restoring = pending.restoring {
-                outcome = await controller.restore(backupID: restoring, newBackupID: operationID)
+            if let loading = pending.loading {
+                outcome = await controller.restore(backupID: loading.id, newBackupID: operationID)
             } else {
                 switch pending.action {
-                case .exchange: outcome = await controller.exchange(backupID: operationID)
+                case .swap: outcome = await controller.exchange(backupID: operationID)
                 case .useOwnInBoth: outcome = await controller.copyFirstToSecond(backupID: operationID)
                 case .usePartnerInBoth: outcome = await controller.copySecondToFirst(backupID: operationID)
                 }
             }
             changed = self.record(outcome, pending: pending, operationID: operationID)
+            self.parked = await controller.parkedLogins()
         }
         return changed
     }
 
-    /// Fold one outcome into the recovery offer and the audit log. The distinction that matters is
-    /// whether the remote host may have written: a refusal happens before any backup exists, so it
-    /// must not leave behind a recovery offer that would shadow a real earlier backup, while a
-    /// transport failure is genuinely unknown and keeps its identifier so the backup stays findable.
+    /// Fold one outcome into the audit log. The distinction that matters is whether the host may
+    /// have written: a refusal happens before anything is parked, so it must not log a parked
+    /// identifier that does not exist, while a transport failure is genuinely unknown and keeps its
+    /// identifier so the parked pair stays findable.
     private func record(_ outcome: ControllerOutcome, pending: Pending, operationID: UUID) -> Bool {
         message = outcome.message
-        let wroteBackup: Bool
+        let parkedAPair: Bool
         var succeeded = false
         switch outcome {
         case .exchanged, .copied, .restored:
             succeeded = true
-            wroteBackup = true
+            parkedAPair = true
         case .partial:
-            wroteBackup = true
+            parkedAPair = true
         case .refused:
-            wroteBackup = false
+            parkedAPair = false
         case .ready, .failed:
-            wroteBackup = true
+            parkedAPair = true
         }
         let entry = ControllerAuditStore.Entry(
-            action: pending.restoring != nil ? .restore : (pending.action == .exchange ? .exchange : .copy),
+            action: pending.loading != nil ? .restore : (pending.action == .swap ? .exchange : .copy),
             host: host, first: account.integration, second: pending.partner.integration,
-            succeeded: succeeded, backupID: wroteBackup ? operationID : nil,
-            restoredFrom: pending.restoring)
+            succeeded: succeeded, backupID: parkedAPair ? operationID : nil,
+            restoredFrom: pending.loading?.id)
         if !audit.append(entry) {
             message += " The controller audit could not be saved locally."
-        }
-        if wroteBackup {
-            // A successful restore consumes the backup it came from; the audit decides what — if
-            // anything — remains offerable for this pair.
-            restorableBackup =
-                succeeded && pending.restoring != nil
-                ? Self.latestBackup(pairing: account, with: pending.partner, in: audit)
-                : operationID
         }
         return succeeded
     }

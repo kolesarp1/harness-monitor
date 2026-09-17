@@ -53,6 +53,18 @@ public struct ControllerAuditStore: Sendable {
         } catch { return false }
     }
 
+    /// The change that parked this pair. A parked pair is stored positionally — "first" and
+    /// "second" — and which lane each position meant is decided by whichever lane started the
+    /// change, so it is knowable only from this record. Without it, loading a pair back could put a
+    /// login in the lane it did not come from.
+    public func entry(forBackup id: UUID) -> Entry? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return data.split(separator: 10).compactMap {
+            try? JSONDecoder().decode(Entry.self, from: Data($0))
+        }
+        .last { $0.backupID == id }
+    }
+
     public func latestRestorableBackup(host: String, first: Integration, second: Integration) -> UUID? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let entries = data.split(separator: 10).compactMap {

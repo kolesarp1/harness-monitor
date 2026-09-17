@@ -44,7 +44,28 @@ public actor ClaudeCredentialController: CredentialController {
         await call(.restore, backupID: backupID, newBackupID: newBackupID)
     }
 
-    private enum Mode: String { case preflight, exchange, copyFirst, copySecond, preflightRestore, restore }
+    /// The parked pairs on this host, newest first. Only the login emails Claude already stores as
+    /// non-secret profile metadata come back — never a token, a refresh token or an account id.
+    public func parkedLogins() async -> [ParkedLogin] {
+        guard case .ok(let output) = await run(script(mode: .list, backupID: nil, newBackupID: nil))
+        else { return [] }
+        return output.split(separator: "\n").compactMap { line in
+            // PARKED <uuid> <epoch> <first-email|-> <second-email|->
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard parts.count == 5, parts[0] == "PARKED", let id = UUID(uuidString: parts[1]) else {
+                return nil
+            }
+            func email(_ raw: String) -> String? { raw == "-" ? nil : raw }
+            return ParkedLogin(
+                id: id, firstEmail: email(parts[3]), secondEmail: email(parts[4]),
+                savedAt: Double(parts[2]).map { Date(timeIntervalSince1970: $0) })
+        }
+        .sorted { ($0.savedAt ?? .distantPast) > ($1.savedAt ?? .distantPast) }
+    }
+
+    private enum Mode: String {
+        case preflight, exchange, copyFirst, copySecond, preflightRestore, restore, list
+    }
 
     private func call(_ mode: Mode, backupID: UUID?, newBackupID: UUID? = nil) async -> ControllerOutcome {
         let outcome = await run(script(mode: mode, backupID: backupID, newBackupID: newBackupID))
@@ -206,7 +227,28 @@ public actor ClaudeCredentialController: CredentialController {
                     if os.path.exists(name):
                         os.unlink(name)
 
+        def parked_email(directory, name):
+            try:
+                _, profile = read_profile(directory / name, 'missing_backup')
+                value = profile['oauthAccount'].get('emailAddress')
+                return value if isinstance(value, str) and value and ' ' not in value else '-'
+            except Exception:
+                return '-'
+
         try:
+            # Listing must survive a signed-out lane: what is parked does not depend on what is
+            # currently loaded, so this runs before any lane credential is read.
+            if os.environ['HU_MODE'] == 'list':
+                root = Path(os.environ['HU_BACKUP_ROOT'])
+                if root.is_dir() and not root.is_symlink():
+                    for entry in sorted(root.iterdir()):
+                        if not entry.is_dir() or entry.is_symlink():
+                            continue
+                        print('PARKED %s %d %s %s' % (
+                            entry.name, int(entry.stat().st_mtime),
+                            parked_email(entry, 'first.profile.json'),
+                            parked_email(entry, 'second.profile.json')))
+                raise SystemExit(0)
             a_dir = Path(os.environ['HU_FIRST']).resolve(strict=True)
             b_dir = Path(os.environ['HU_SECOND']).resolve(strict=True)
             if a_dir == b_dir:

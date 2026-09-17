@@ -1,7 +1,6 @@
 import AppKit
 import HarnessUsageCore
 import SwiftUI
-import UniformTypeIdentifiers
 
 // The Settings window: the app's one glass (`glassChrome`) and its one `cs*` palette, in a
 // macOS-preferences layout — a sidebar of panes over the version line, and a content area of grouped
@@ -106,6 +105,10 @@ import UniformTypeIdentifiers
                     Image(systemName: "house.fill")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(selected ? Color.csOnAccent : Color.csLabel)
+                case .lanes:
+                    Image(systemName: "person.2.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(selected ? Color.csOnAccent : Color.csLabel)
                 case .provider(let account):
                     // The provider's own mark in its own colors, selected or not — the accent tile is
                     // the selection signal; repainting the mark would only blur it. A selected tile is
@@ -131,10 +134,13 @@ import UniformTypeIdentifiers
                 switch pane {
                 case .general:
                     GeneralPane(settings: settings)
+                case .lanes:
+                    LanesPane(
+                        accounts: accounts, usage: usage, controllerAudit: controllerAudit,
+                        onAccountsChanged: onAccountsChanged)
                 case .provider(let account):
                     ProviderPane(
                         settings: settings, account: account, accounts: accounts,
-                        controllerAudit: controllerAudit,
                         integrations: integrations, usage: usage,
                         onAccountsChanged: onAccountsChanged,
                         canDelete: accounts.filter { $0.harness == account.harness }.count > 1,
@@ -154,11 +160,13 @@ import UniformTypeIdentifiers
 
     private enum Pane: Equatable, Identifiable {
         case general
+        case lanes
         case provider(AccountConfig)
 
         var id: String {
             switch self {
             case .general: "general"
+            case .lanes: "lanes"
             case .provider(let account): "provider-\(account.integration.rawValue)"
             }
         }
@@ -166,6 +174,7 @@ import UniformTypeIdentifiers
         var title: String {
             switch self {
             case .general: "General"
+            case .lanes: "Accounts & lanes"
             // `displayName` carries the account label once a harness has more than one, so two
             // Claude panes read "Claude · Personal" and "Claude · Work" rather than twice the same.
             case .provider(let account): account.integration.displayName
@@ -174,7 +183,10 @@ import UniformTypeIdentifiers
     }
 
     private var panes: [Pane] {
-        [.general] + accounts.map(Pane.provider)
+        // The lanes pane only earns its place when some provider has more than one login to keep
+        // straight; with one login per harness there is nothing it could tell the user.
+        let lanes: [Pane] = accounts.multiLaneHarnesses.isEmpty ? [] : [.lanes]
+        return [.general] + lanes + accounts.map(Pane.provider)
     }
 }
 
@@ -282,16 +294,11 @@ private struct ProviderPane: View {
     @State private var remoteLogin = RemoteLogin()
     @State private var remoteLoginResponse = ""
     @State private var sourceSaved = false
-    @State private var assignedSourceRaw = ""
-    /// The controller flow — eligibility, preflight, confirmation and audit — lives in Core; this
-    /// pane only presents it.
-    @State private var controller: CredentialControllerSession
 
     private var integration: Integration { account.integration }
 
     init(
         settings: SettingsStore, account: AccountConfig, accounts: [AccountConfig],
-        controllerAudit: ControllerAuditStore,
         integrations: IntegrationStore?, usage: UsageStore?,
         onAccountsChanged: @escaping @MainActor () async -> Void,
         canDelete: Bool, onDeleteSubscription: @escaping @MainActor (Integration) -> Void
@@ -307,10 +314,6 @@ private struct ProviderPane: View {
         _remote = State(initialValue: account.host.isRemote)
         _remoteServer = State(initialValue: account.host.sshAlias ?? "")
         _tokenLocation = State(initialValue: account.configDir ?? "~/\(account.harness.descriptor.homeRelativePath)")
-        _assignedSourceRaw = State(initialValue: account.source(in: accounts).integration.rawValue)
-        _controller = State(
-            initialValue: CredentialControllerSession(
-                account: account, accounts: accounts, audit: controllerAudit))
     }
 
     private func detected(_ i: Integration) -> Bool { integrations?.detected.contains(i) ?? true }
@@ -326,44 +329,6 @@ private struct ProviderPane: View {
 
     private var tokenSubtitle: String {
         supportsTokens ? "Today's tokens in, out, and total below the meters" : "This agent doesn't report token counts"
-    }
-
-    private var loginProfiles: [AccountConfig] { accounts.filter { $0.harness == account.harness } }
-
-    private var assignedSource: AccountConfig {
-        loginProfiles.first { $0.integration.rawValue == assignedSourceRaw } ?? account
-    }
-
-    private func profileName(_ profile: AccountConfig) -> String {
-        profile.label.isEmpty ? profile.harness.displayName : profile.label
-    }
-
-    private var remoteActionOptions: [(String, CredentialControllerSession.Action)] {
-        [
-            ("Exchange both", .exchange),
-            ("Use \(profileName(account)) in both", .useOwnInBoth),
-            ("Use \(controller.partner.map(profileName) ?? "other") in both", .usePartnerInBoth),
-        ]
-    }
-
-    /// The confirmation copy for whatever the preflight staged.
-    private var pendingActionTitle: String {
-        guard let pending = controller.pending else { return "" }
-        let other = profileName(pending.partner)
-        if pending.restoring != nil { return "Restore the original remote logins?" }
-        switch pending.action {
-        case .exchange: return "Exchange \(profileName(account)) and \(other)?"
-        case .useOwnInBoth: return "Use \(profileName(account)) in both remote profiles?"
-        case .usePartnerInBoth: return "Use \(other) in both remote profiles?"
-        }
-    }
-
-    private var pendingActionMessage: String {
-        guard let pending = controller.pending else { return "" }
-        if pending.restoring != nil {
-            return "The saved credential files will be put back in their original profile directories. Restart the affected Claude sessions afterward."
-        }
-        return "Harness will back up both credentials and account metadata on \(account.host.sshAlias ?? "the SSH box"), then apply this action. Restart affected Claude sessions to use the new login."
     }
 
     var body: some View {
@@ -389,93 +354,6 @@ private struct ProviderPane: View {
                 }
                 GlassDivider()
                 notchShowsRow
-            }
-            SettingsGroup("Operational assignment") {
-                SettingsRow(
-                    "Assigned login",
-                    subtitle: "Drag a login profile here, or choose one. This only changes monitored usage."
-                ) {
-                    LoginAssignmentTarget(label: profileName(assignedSource)) { source in
-                        assign(source)
-                    }
-                }
-                GlassDivider()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Login profiles")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color.csFaint)
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 7) {
-                            ForEach(loginProfiles, id: \.integration) { profile in
-                                LoginProfileChip(
-                                    profile: profile, label: profileName(profile),
-                                    selected: profile.integration == assignedSource.integration)
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                GlassDivider()
-                SettingsRow("Choose login", subtitle: "Keyboard-friendly alternative to drag and drop") {
-                    PopupControl(
-                        options: loginProfiles.map { (profileName($0), $0.integration) },
-                        selection: Binding(get: { assignedSource.integration }, set: { assign($0) }),
-                        accessibilityLabel: "Assigned login profile")
-                }
-            }
-            if !controller.candidates.isEmpty {
-                SettingsGroup("Remote login controller") {
-                    SettingsRow(
-                        "Change with",
-                        subtitle: "Drag a profile here. Both original logins are backed up on the SSH box."
-                    ) {
-                        CredentialExchangeTarget(
-                            label: controller.partner.map(profileName) ?? "Choose profile"
-                        ) { source in
-                            Task { await controller.prepare(with: source) }
-                        }
-                    }
-                    GlassDivider()
-                    SettingsRow("Other login") {
-                        PopupControl(
-                            options: controller.candidates.map { (profileName($0), $0.integration) },
-                            selection: Binding(
-                                get: { controller.partner?.integration ?? integration },
-                                set: { controller.select($0) }),
-                            accessibilityLabel: "Other remote login profile")
-                    }
-                    GlassDivider()
-                    SettingsRow("Action") {
-                        PopupControl(
-                            options: remoteActionOptions,
-                            selection: Binding(
-                                get: { controller.action }, set: { controller.action = $0 }),
-                            accessibilityLabel: "Remote credential action")
-                    }
-                    GlassDivider()
-                    SettingsRow("Change remote logins", subtitle: "Affects the profile directories after Claude restarts.") {
-                        Button(controller.isRunning ? "Working…" : "Prepare change") {
-                            Task { await controller.prepare() }
-                        }
-                        .disabled(controller.isRunning || controller.partner == nil)
-                    }
-                    if controller.restorableBackup != nil {
-                        GlassDivider()
-                        SettingsRow("Recover originals", subtitle: "Restore the last change from its remote backup.") {
-                            Button("Prepare restore") { Task { await controller.prepareRestore() } }
-                                .disabled(controller.isRunning)
-                        }
-                    }
-                    if !controller.message.isEmpty {
-                        GlassDivider()
-                        Text(controller.message)
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(Color.csLabel)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 9)
-                    }
-                }
             }
             SettingsGroup("Data source") {
                 SettingsRow("This profile lives on", subtitle: remote ? "Connects over SSH and refreshes assigned slots." : "Reads this Mac's harness login when assigned.") {
@@ -566,24 +444,6 @@ private struct ProviderPane: View {
                     .foregroundStyle(Color.csRed)
             }
         }
-        .confirmationDialog(
-            pendingActionTitle,
-            isPresented: Binding(
-                get: { controller.pending != nil }, set: { if !$0 { controller.cancel() } })
-        ) {
-            Button(
-                controller.pending?.restoring == nil ? "Change remote logins" : "Restore from remote backup",
-                role: .destructive
-            ) {
-                Task {
-                    // A remote login change moves which account each profile directory speaks for,
-                    // so every ring reading those profiles has to be re-read.
-                    if await controller.confirm() { await onAccountsChanged() }
-                }
-            }
-        } message: {
-            Text(pendingActionMessage)
-        }
     }
 
     private func submitRemoteLoginResponse() {
@@ -597,15 +457,6 @@ private struct ProviderPane: View {
             AccountsFile.setHost(host, for: integration, at: Accounts.configuredURL)
             && AccountsFile.setConfigDir(tokenLocation, for: integration, at: Accounts.configuredURL)
         guard sourceSaved else { return }
-        Task { await onAccountsChanged() }
-    }
-
-    private func assign(_ source: Integration) {
-        guard source.harness == integration.harness,
-            AccountsFile.setUsageSource(source, for: integration, at: Accounts.configuredURL)
-        else { return }
-        assignedSourceRaw = source.rawValue
-        sourceSaved = false
         Task { await onAccountsChanged() }
     }
 
@@ -656,106 +507,6 @@ private struct ProviderPane: View {
     }
 }
 
-// MARK: - Operational login assignment
-
-/// A profile is a draggable reference to an already-configured login location. The drag payload is
-/// only an Integration key; no path or credential is placed on the pasteboard.
-private struct LoginProfileChip: View {
-    let profile: AccountConfig
-    let label: String
-    let selected: Bool
-
-    var body: some View {
-        HStack(spacing: 6) {
-            BrandMark(
-                integration: profile.integration, size: 14,
-                tint: profile.integration.descriptor.brandColor)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(label)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Color.csTitle)
-                Text(profile.host.sshAlias ?? "This Mac")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(Color.csFaint)
-            }
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 8)
-        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(selected ? Color.csSidebarSel : Color.csWell))
-        .overlay {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(selected ? Color.csAccent.opacity(0.65) : Color.csBorder, lineWidth: 1)
-        }
-        .onDrag { NSItemProvider(object: profile.integration.rawValue as NSString) }
-        .pointerOnHover()
-        .accessibilityLabel("Drag \(label) login profile")
-    }
-}
-
-private struct LoginAssignmentTarget: View {
-    let label: String
-    let assign: (Integration) -> Void
-    @State private var targeted = false
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: targeted ? "arrow.down.circle.fill" : "person.crop.circle")
-                .foregroundStyle(targeted ? Color.csAccent : Color.csFaint)
-            Text(label)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(Color.csTitle)
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 9)
-        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(targeted ? Color.csControlHover : Color.csWell))
-        .overlay {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(targeted ? Color.csAccent : Color.csBorder, lineWidth: 1)
-        }
-        .onDrop(of: [.plainText], isTargeted: $targeted) { providers in
-            guard let provider = providers.first else { return false }
-            provider.loadObject(ofClass: NSString.self) { object, _ in
-                guard let raw = object as? String, let source = Integration(rawValue: raw) else { return }
-                Task { @MainActor in assign(source) }
-            }
-            return true
-        }
-        .accessibilityLabel("Drop login profile to assign it")
-    }
-}
-
-private struct CredentialExchangeTarget: View {
-    let label: String
-    let prepare: (Integration) -> Void
-    @State private var targeted = false
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: targeted ? "arrow.down.circle.fill" : "arrow.left.arrow.right")
-                .foregroundStyle(targeted ? Color.csAccent : Color.csFaint)
-            Text(label)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(Color.csTitle)
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 9)
-        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(targeted ? Color.csControlHover : Color.csWell))
-        .overlay {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(targeted ? Color.csAccent : Color.csBorder, lineWidth: 1)
-        }
-        .onDrop(of: [.plainText], isTargeted: $targeted) { providers in
-            guard let provider = providers.first else { return false }
-            provider.loadObject(ofClass: NSString.self) { object, _ in
-                guard let raw = object as? String, let profile = Integration(rawValue: raw) else { return }
-                Task { @MainActor in prepare(profile) }
-            }
-            return true
-        }
-        .accessibilityLabel("Drop login profile to prepare credential exchange")
-    }
-}
-
 extension SettingsStore {
     // Two-way binding into the private(set) store: read the value, write back a mutated copy that persists.
     fileprivate func bind<V>(_ kp: WritableKeyPath<HarnessUsageCore.Settings, V>) -> Binding<V> {
@@ -801,7 +552,7 @@ private struct SettingsCaption: View {
 
 // An uppercase caption above a clipped, bordered glass card; rows go inside, separated by
 // `GlassDivider`. The caption is optional, for a card whose rows already name themselves.
-private struct SettingsGroup<Content: View>: View {
+struct SettingsGroup<Content: View>: View {
     let caption: String?
     @ViewBuilder var content: () -> Content
 
@@ -825,7 +576,7 @@ private struct SettingsGroup<Content: View>: View {
 }
 
 // One setting row: a label (+ optional subtitle) on the left, its control on the right.
-private struct SettingsRow<Control: View>: View {
+struct SettingsRow<Control: View>: View {
     let label: String
     var subtitle: String?
     @ViewBuilder var control: () -> Control

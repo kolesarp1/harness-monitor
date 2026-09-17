@@ -54,20 +54,25 @@ one.
 | `label` | shown next to the brand mark (`Claude · Work`). Ignored while a harness has only one account. |
 | `host` | an alias from your `~/.ssh/config`, for an account signed in on another machine. Omit for this Mac. |
 | `configDir` | the harness's config directory. Omit for the default. `~` expands on the account's *own* machine. |
-| `usageSource` | optional account slug whose existing login this ring monitors. Omit to monitor this ring's own login; use `""` to use the default login. |
+| `usageSource` | optional account slug whose existing login this lane monitors. Omit to monitor the lane's own login; use `""` for the default one. |
 
-Each configured ring also remains a reusable **login profile**. In Settings, drag a same-provider profile onto
-the ring's **Assigned login** target to switch which usage it monitors, or assign one profile to multiple rings.
-This never logs a CLI in or out, writes a provider credential, or changes which account a CLI command uses.
+### Lanes and accounts
 
-For two Claude profiles on the **same SSH host**, Settings also has a **Remote login controller**. Drag a
-profile onto **Change with** (or choose it in the picker), choose **Exchange both** or **Use one login in both**,
-review the read-only preflight, then confirm.
-Harness backs up both `.credentials.json` files and their `.claude.json` account metadata in a private
-`~/.harness-controller/backups/<operation-id>/` directory **on that host**, then exchanges the logins between
-the two existing config directories or copies one into both. No credential crosses to the Mac. **Recover
-originals** restores the saved logins; the local audit contains only profile keys, the host alias, and backup
-IDs. Restart each affected Claude session after a change or restore so the process reads its new login.
+A **lane** is a directory a CLI runs against (`~/.claude-a`); an **account** is the login that owns the quota.
+No account belongs to a lane — you move logins between lanes — so lanes are named `Lane A`, `Lane B` by their
+position in `accounts.json`, and accounts are named by the email the provider reports. That split is the point:
+a label like "Personal" cannot follow a login when it moves, so it would end up describing the wrong account.
+
+Settings' **Accounts & lanes** pane shows, per provider: every account currently signed in with its meters and
+which lanes hold it (one account in two lanes says so, because those lanes then share one quota), every lane
+with the account it is holding right now, and anything parked.
+
+For two Claude lanes on the **same SSH host** it also offers **Swap A ⇄ B** and **use one login in both** — for
+working past one account's limit. Harness parks both `.credentials.json` files and their `.claude.json` account
+metadata in a private `~/.harness-controller/backups/<operation-id>/` directory **on that host**, then moves the
+logins. No credential crosses to the Mac; the local audit holds only lane keys, the host alias and parked-pair
+IDs. **Parked logins** lists what is saved there, by the lane each login came from, and loads a pair back.
+Restart each affected Claude session afterwards, or it will write its old login back over the change.
 
 A **local** account is read exactly as the single-account app always did, from its own config directory:
 `CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex. Claude Code names the Keychain item for a non-default

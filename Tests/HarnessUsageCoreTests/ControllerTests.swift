@@ -94,7 +94,12 @@ private let second = AccountConfig(
 /// Answers with a scripted sequence, so a test can pin the preflight and the action separately.
 private actor StubController: CredentialController {
     private var scripted: [ControllerOutcome]
-    init(_ scripted: [ControllerOutcome]) { self.scripted = scripted }
+    private let parked: [ParkedLogin]
+
+    init(_ scripted: [ControllerOutcome], parked: [ParkedLogin] = []) {
+        self.scripted = scripted
+        self.parked = parked
+    }
 
     private func next() -> ControllerOutcome {
         scripted.isEmpty ? .failed("the test ran out of scripted outcomes") : scripted.removeFirst()
@@ -106,13 +111,14 @@ private actor StubController: CredentialController {
     func copySecondToFirst(backupID: UUID) async -> ControllerOutcome { next() }
     func preflightRestore(backupID: UUID) async -> ControllerOutcome { next() }
     func restore(backupID: UUID, newBackupID: UUID) async -> ControllerOutcome { next() }
+    func parkedLogins() async -> [ParkedLogin] { parked }
 }
 
 @MainActor
 private func makeSession(
-    audit: ControllerAuditStore, outcomes: [ControllerOutcome]
+    audit: ControllerAuditStore, outcomes: [ControllerOutcome], parked: [ParkedLogin] = []
 ) -> CredentialControllerSession {
-    let stub = StubController(outcomes)
+    let stub = StubController(outcomes, parked: parked)
     return CredentialControllerSession(
         account: first, accounts: [first, second], audit: audit, makeController: { _, _ in stub })
 }
@@ -122,86 +128,124 @@ private func temporaryAudit() -> (ControllerAuditStore, URL) {
     return (ControllerAuditStore(url: dir.appendingPathComponent("controller-audit.jsonl")), dir)
 }
 
+private func auditedEntries(_ store: ControllerAuditStore) -> [ControllerAuditStore.Entry] {
+    guard let data = try? Data(contentsOf: store.url) else { return [] }
+    return data.split(separator: 10).compactMap {
+        try? JSONDecoder().decode(ControllerAuditStore.Entry.self, from: Data($0))
+    }
+}
+
 @MainActor
 @Test func aRefusedPreflightStagesNothing() async throws {
     let (audit, dir) = temporaryAudit()
     defer { try? FileManager.default.removeItem(at: dir) }
-    let session = makeSession(audit: audit, outcomes: [.refused("One remote Claude profile has no readable credential file.")])
+    let session = makeSession(
+        audit: audit, outcomes: [.refused("One remote Claude profile has no readable credential file.")])
     #expect(session.partner?.integration == second.integration)
 
-    await session.prepare()
+    await session.prepare(.swap)
     #expect(session.pending == nil)
     #expect(session.message.contains("no readable credential file"))
-    #expect(session.restorableBackup == nil)
-    #expect(!FileManager.default.fileExists(atPath: audit.url.path))  // nothing ran, nothing audited
+    #expect(auditedEntries(audit).isEmpty)  // nothing ran, nothing audited
 }
 
 @MainActor
-@Test func aConfirmedExchangeRecordsItsBackupAndReportsTheChange() async throws {
+@Test func aConfirmedSwapIsAuditedWithThePairItParked() async throws {
     let (audit, dir) = temporaryAudit()
     defer { try? FileManager.default.removeItem(at: dir) }
     let session = makeSession(audit: audit, outcomes: [.ready, .exchanged(backupID: UUID())])
 
-    await session.prepare()
-    #expect(session.pending?.action == .exchange)
+    await session.prepare(.swap)
+    #expect(session.pending?.action == .swap)
+    #expect(session.pending?.loading == nil)
     #expect(await session.confirm())
-    let backup = try #require(session.restorableBackup)
-    #expect(
-        audit.latestRestorableBackup(
-            host: "box", first: first.integration, second: second.integration) == backup)
+
+    let entry = try #require(auditedEntries(audit).last)
+    #expect(entry.action == .exchange)
+    #expect(entry.succeeded)
+    #expect(entry.backupID != nil)
 }
 
-// A refusal happens before the remote host writes anything, so it must not leave a recovery offer
-// pointing at a backup that was never taken — which would also hide the last real one.
+// A refusal happens before the host writes anything, so the audit must not claim a parked pair that
+// was never taken — the log is what says where a login can still be found.
 @MainActor
-@Test func aRefusedChangeLeavesTheEarlierBackupRecoverable() async throws {
+@Test func aRefusedChangeIsAuditedWithoutAParkedPair() async throws {
     let (audit, dir) = temporaryAudit()
     defer { try? FileManager.default.removeItem(at: dir) }
     let session = makeSession(
-        audit: audit,
-        outcomes: [.ready, .exchanged(backupID: UUID()), .ready, .refused("Another remote credential operation is running.")])
+        audit: audit, outcomes: [.ready, .refused("Another remote credential operation is running.")])
 
-    await session.prepare()
-    #expect(await session.confirm())
-    let original = try #require(session.restorableBackup)
-
-    await session.prepare()
+    await session.prepare(.swap)
     #expect(!(await session.confirm()))
-    #expect(session.restorableBackup == original)
-    #expect(
-        audit.latestRestorableBackup(
-            host: "box", first: first.integration, second: second.integration) == original)
+    let entry = try #require(auditedEntries(audit).last)
+    #expect(!entry.succeeded)
+    #expect(entry.backupID == nil)
 }
 
-// An ssh failure is genuinely ambiguous: the remote may have written before the link dropped, so
-// the operation keeps its identifier and the backup stays findable.
+// An ssh failure is genuinely ambiguous: the host may have parked and written before the link
+// dropped, so the identifier is kept and the pair stays findable.
 @MainActor
-@Test func anInterruptedChangeKeepsItsBackupFindable() async throws {
+@Test func anInterruptedChangeKeepsItsParkedPairFindable() async throws {
     let (audit, dir) = temporaryAudit()
     defer { try? FileManager.default.removeItem(at: dir) }
     let session = makeSession(audit: audit, outcomes: [.ready, .failed("ssh timed out")])
 
-    await session.prepare()
+    await session.prepare(.swap)
     #expect(!(await session.confirm()))
     #expect(session.message == "ssh timed out")
-    let backup = try #require(session.restorableBackup)
-    #expect(
-        audit.latestRestorableBackup(
-            host: "box", first: first.integration, second: second.integration) == backup)
+    let entry = try #require(auditedEntries(audit).last)
+    #expect(!entry.succeeded)
+    #expect(entry.backupID != nil)
 }
 
+// What is parked is read back from the machine that holds it, never inferred locally — a lane has no
+// home account, so the only truth about a saved pair is the pair itself.
 @MainActor
-@Test func aSuccessfulRestoreConsumesTheBackupItCameFrom() async throws {
+@Test func parkedPairsComeFromTheOwningMachine() async throws {
     let (audit, dir) = temporaryAudit()
     defer { try? FileManager.default.removeItem(at: dir) }
-    let session = makeSession(
-        audit: audit,
-        outcomes: [.ready, .exchanged(backupID: UUID()), .ready, .restored(backupID: UUID())])
+    let entry = ParkedLogin(
+        id: UUID(), firstEmail: "one@example.com", secondEmail: "two@example.com",
+        savedAt: Date(timeIntervalSince1970: 1_700_000_000))
+    let session = makeSession(audit: audit, outcomes: [.ready, .restored(backupID: UUID())], parked: [entry])
 
-    await session.prepare()
+    await session.refreshParked()
+    #expect(session.parked == [entry])
+
+    await session.prepareLoad(entry)
+    #expect(session.pending?.loading == entry)
     #expect(await session.confirm())
-    await session.prepareRestore()
-    #expect(session.pending?.restoring != nil)
-    #expect(await session.confirm())
-    #expect(session.restorableBackup == nil)
+    #expect(auditedEntries(audit).last?.restoredFrom == entry.id)
+}
+
+// MARK: - Lanes
+
+@Test func lanesAreLetteredInFileOrderAcrossEveryMachine() {
+    let accounts = [
+        AccountConfig(harness: .claude, label: "Personal", host: .ssh("sunny"), configDir: "~/.claude-a"),
+        AccountConfig(harness: .claude, account: "work", label: "Work", host: .ssh("sunny"), configDir: "~/.claude-b"),
+        AccountConfig(harness: .claude, account: "factory", host: .ssh("sparkles"), configDir: "~/.claude-factory"),
+        AccountConfig(harness: .cursor),
+    ]
+    let lanes = accounts.lanes(of: .claude)
+    #expect(lanes.map(\.letter) == ["A", "B", "C"])
+    #expect(lanes.map(\.name) == ["Lane A", "Lane B", "Lane C"])
+    // A lane on another machine still gets its own letter, so no two lanes are ever both "A".
+    #expect(lanes[2].machine == "sparkles")
+    #expect(lanes[2].directory == "~/.claude-factory")
+    // A single-login harness has no lanes worth lettering.
+    #expect(accounts.multiLaneHarnesses == [.claude])
+}
+
+@Test func aLaneIsNamedByItsPlaceNotByALabel() {
+    let accounts = [
+        AccountConfig(harness: .codex, label: "Personal", host: .ssh("sunny")),
+        AccountConfig(harness: .codex, account: "work", label: "Work", host: .ssh("sunny"), configDir: "~/.codex-2"),
+    ]
+    let lanes = accounts.lanes(of: .codex)
+    // The label is deliberately absent from every name a lane answers to: a login that moves would
+    // leave the label describing an account that is no longer there.
+    #expect(!lanes[0].name.contains("Personal"))
+    #expect(lanes[0].directory == "~/.codex")
+    #expect(lanes[1].directory == "~/.codex-2")
 }

@@ -43,6 +43,8 @@ func runDump() async {
         return "fallback[in=\(i) out=\(o) total=\(i + o)]"
     }
     func note(_ s: UsageSnapshot?) -> String { "note=\(s?.note ?? "—")" }
+    // Which account this lane is actually holding — the one fact a label cannot be trusted for.
+    func account(_ s: UsageSnapshot?) -> String { "account=\(s?.accountEmail ?? "—")" }
     func age(_ s: UsageSnapshot?) -> String {
         guard let d = s?.lastUpdated else { return "age=—" }
         return "age=\(Int(Date().timeIntervalSince(d).rounded()))s"
@@ -60,7 +62,7 @@ func runDump() async {
     for integration in keys {
         let snap = engine.usage[integration]
         print(
-            "\(integration.rawValue) usage: source=\(snap?.source.rawValue ?? "none") \(rows(snap)) \(tokens(snap)) \(cost(snap)) \(fallback(snap)) \(age(snap)) \(note(snap))")
+            "\(integration.rawValue) usage: source=\(snap?.source.rawValue ?? "none") \(account(snap)) \(rows(snap)) \(tokens(snap)) \(cost(snap)) \(fallback(snap)) \(age(snap)) \(note(snap))")
     }
 }
 
