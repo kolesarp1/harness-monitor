@@ -80,12 +80,12 @@ private let expected = Date(timeIntervalSince1970: 1_766_000_000)
 @Test(
     arguments: [
         ("free", "Free"), ("go", "Go"), ("plus", "Plus"), ("pro", "Pro 20x"),
-        ("prolite", "Pro 5x"), ("Pro 5x", "Pro 5x"), ("team", "Team"),
-        ("self_serve_business_prolite", "Self Serve Business ProLite"),
-        ("self_serve_business_usage_based", "Self Serve Business Usage Based"),
+        ("prolite", "Pro 5x"), ("Pro Lite", "Pro 5x"), ("team", "Team"),
+        ("self_serve_business_prolite", "Business 5x"),
+        ("self_serve_business_usage_based", "Business Flex"),
         ("business", "Business"), ("ent26", "Enterprise"),
-        ("enterprise_cbp_automation", "Enterprise (Automation)"),
-        ("enterprise_cbp_usage_based", "Enterprise CBP Usage Based"),
+        ("enterprise_cbp_automation", "Enterprise Auto"),
+        ("enterprise_cbp_usage_based", "Enterprise Flex"),
         ("enterprise", "Enterprise"), ("hc", "Enterprise"),
         ("education", "Edu"), ("edu", "Edu"), ("edu_plus", "Edu Plus"),
         ("edu_pro", "Edu Pro"),
@@ -96,7 +96,7 @@ func knownPlanLabelsMatchCodex(_ raw: String, _ expected: String) {
 
 @Test func planLabelsHandlePersistedCapitalizationAndUnknownValues() {
     #expect(Integration.codex.planDisplayName("Prolite") == "Pro 5x")
-    #expect(Integration.codex.planDisplayName("SELF_SERVE_BUSINESS_USAGE_BASED") == "Self Serve Business Usage Based")
+    #expect(Integration.codex.planDisplayName("SELF_SERVE_BUSINESS_USAGE_BASED") == "Business Flex")
     #expect(CodexAuth.planLabel("future_plan") == "Future_plan")
     #expect(CodexAuth.planLabel("  ") == nil)
 }
